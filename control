@@ -1,0 +1,10 @@
+Package: com.ytliteplus.localsqueue
+Name: YTLocalQueue
+Architecture: iphoneos-arm
+Description: Local queue buttons and auto-advance for YouTube
+Maintainer: YTLitePlus
+Author: YTLitePlus
+Section: Tweaks
+Version: 1.0-72+debug
+Depends: mobilesubstrate
+
