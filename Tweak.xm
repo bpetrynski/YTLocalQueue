@@ -34,6 +34,7 @@
 
 #import "LocalQueueManager.h"
 #import "LocalQueueViewController.h"
+#import "AutoAdvanceController.h"
 #import <objc/runtime.h>
 
 // Associated-object keys used across this file (only needed if we add advanced thumbnail injection)
@@ -43,6 +44,7 @@ static __weak YTPlayerViewController *ytlp_currentPlayerVC = nil;
 static NSTimeInterval ytlp_lastQueueAdvanceTime = 0;
 static NSString *ytlp_lastPlayedVideoId = nil;
 static NSTimer *ytlp_endCheckTimer = nil;
+static dispatch_source_t ytlp_dispatchTimer = nil;  // GCD timer for background/PiP
 static CGFloat ytlp_lastKnownPosition = 0;
 static CGFloat ytlp_lastKnownTotal = 0;
 
@@ -978,38 +980,13 @@ typedef void (*PlayerSeekToTimeIMP)(id, SEL, CGFloat);
 static PlayerSeekToTimeIMP origPlayerSeekToTime = NULL;
 
 static void ytlp_playerSeekToTime(id self, SEL _cmd, CGFloat time) {
-    if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-        CGFloat currentPos = 0;
-        CGFloat totalTime = 0;
-        
-        if ([self respondsToSelector:@selector(currentVideoMediaTime)]) {
-            currentPos = [(id)self currentVideoMediaTime];
-        }
-        if ([self respondsToSelector:@selector(currentVideoTotalMediaTime)]) {
-            totalTime = [(id)self currentVideoTotalMediaTime];
-        }
-        
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        BOOL cooldownOk = (now - ytlp_lastQueueAdvanceTime >= 3.0);
-        
-        if (totalTime > 10.0 && cooldownOk) {
-            // Case 1: Seeking TO the end (user scrubbed to end) - advance before loop
-            if (time >= (totalTime - 2.0)) {
-                ytlp_playNextFromQueue();
-                return;
-            }
-            
-            // Case 2: Seeking to start while at significant position (loop detection)
-            BOOL seekingToStart = (time < 3.0);
-            BOOL wasNearEnd = (currentPos >= (totalTime - 5.0));
-            BOOL wasPastMiddle = (currentPos > (totalTime * 0.5));
-            
-            if (seekingToStart && (wasNearEnd || wasPastMiddle)) {
-                ytlp_playNextFromQueue();
-                return;
-            }
-        }
+    CGFloat totalTime = 0;
+    if ([self respondsToSelector:@selector(currentVideoTotalMediaTime)]) {
+        totalTime = [(id)self currentVideoTotalMediaTime];
     }
+    
+    // Forward to AutoAdvanceController
+    [[YTLPAutoAdvanceController shared] handleSeekToTime:time totalTime:totalTime];
     
     // Execute normal seek
     if (origPlayerSeekToTime) origPlayerSeekToTime(self, _cmd, time);
@@ -1020,22 +997,13 @@ typedef void (*PlayerScrubToTimeIMP)(id, SEL, CGFloat);
 static PlayerScrubToTimeIMP origPlayerScrubToTime = NULL;
 
 static void ytlp_playerScrubToTime(id self, SEL _cmd, CGFloat time) {
-    // Detect if scrubbing TO the end - advance queue before loop happens
-    if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-        CGFloat totalTime = 0;
-        if ([self respondsToSelector:@selector(currentVideoTotalMediaTime)]) {
-            totalTime = [(id)self currentVideoTotalMediaTime];
-        }
-        
-        // If scrubbing to very near the end (within 2 seconds), advance queue instead
-        if (totalTime > 10.0 && time >= (totalTime - 2.0)) {
-            NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-            if (now - ytlp_lastQueueAdvanceTime >= 3.0) {
-                ytlp_playNextFromQueue();
-                return; // Don't scrub to end
-            }
-        }
+    CGFloat totalTime = 0;
+    if ([self respondsToSelector:@selector(currentVideoTotalMediaTime)]) {
+        totalTime = [(id)self currentVideoTotalMediaTime];
     }
+    
+    // Forward to AutoAdvanceController
+    [[YTLPAutoAdvanceController shared] handleSeekToTime:time totalTime:totalTime];
     
     if (origPlayerScrubToTime) origPlayerScrubToTime(self, _cmd, time);
 }
@@ -1047,10 +1015,6 @@ static SingleVideoTimeDidChangeIMP origSingleVideoTimeDidChange = NULL;
 static SingleVideoTimeDidChangeIMP origPotentiallyMutatedSingleVideoTimeDidChange = NULL;
 
 static void ytlp_handleVideoTimeChange(id self, YTSingleVideoTime *videoTime) {
-    if (!YTLP_AutoAdvanceEnabled() || [[YTLPLocalQueueManager shared] isEmpty]) {
-        return;
-    }
-    
     CGFloat currentTime = videoTime.time;
     CGFloat totalTime = 0;
     
@@ -1058,49 +1022,8 @@ static void ytlp_handleVideoTimeChange(id self, YTSingleVideoTime *videoTime) {
         totalTime = [(id)self currentVideoTotalMediaTime];
     }
     
-    // Skip if we don't have valid times
-    if (totalTime < 10.0) {
-        ytlp_lastTimeChangePosition = currentTime;
-        ytlp_lastTimeChangeTotal = totalTime;
-        return;
-    }
-    
-    // Track if playback started (position ever exceeded 1 second)
-    if (currentTime > 1.0) {
-        ytlp_playbackStarted = YES;
-    }
-    
-    // Reset if video changed
-    if (fabs(totalTime - ytlp_lastTimeChangeTotal) > 5.0) {
-        ytlp_playbackStarted = (currentTime > 1.0);
-    }
-    
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    BOOL cooldownOk = (now - ytlp_lastQueueAdvanceTime >= 3.0);
-    
-    // SIMPLE LOOP DETECTION: If playback started and now at position ~0, it's a loop
-    BOOL nowAtStart = (currentTime < 1.0);
-    
-    if (nowAtStart && ytlp_playbackStarted && cooldownOk) {
-        // This is a loop - advance queue
-        ytlp_lastTimeChangePosition = 0;
-        ytlp_lastTimeChangeTotal = 0;
-        ytlp_playbackStarted = NO;
-        ytlp_playNextFromQueue();
-        return;
-    }
-    
-    // Update tracking
-    ytlp_lastTimeChangePosition = currentTime;
-    ytlp_lastTimeChangeTotal = totalTime;
-    
-    // Proactive advance: if we're very close to the end, advance before loop
-    if (currentTime >= (totalTime - 1.0) && totalTime > 10.0 && cooldownOk) {
-        ytlp_lastTimeChangePosition = 0;
-        ytlp_lastTimeChangeTotal = 0;
-        ytlp_playbackStarted = NO;
-        ytlp_playNextFromQueue();
-    }
+    // Forward to AutoAdvanceController
+    [[YTLPAutoAdvanceController shared] handleTimeUpdate:currentTime totalTime:totalTime];
 }
 
 static void ytlp_singleVideoTimeDidChange(id self, SEL _cmd, id singleVideo, YTSingleVideoTime *videoTime) {
@@ -1120,8 +1043,11 @@ static void ytlp_playerViewDidAppear(id self, SEL _cmd, BOOL animated) {
     // Store reference in manager so LocalQueueViewController can access it
     [[YTLPLocalQueueManager shared] setCurrentPlayerViewController:self];
     
-    // Start monitoring immediately when player appears
-    ytlp_playbackStarted = NO;  // Reset for new video
+    // Start AutoAdvanceController monitoring
+    [[YTLPAutoAdvanceController shared] startMonitoringWithPlayerViewController:self];
+    
+    // Also start legacy monitoring as backup
+    ytlp_playbackStarted = NO;
     ytlp_startEndMonitoring();
     
     // Update currently playing video for the Local Queue view
@@ -1519,32 +1445,8 @@ static void ytlp_singleVideoPlayerRateDidChange(id self, SEL _cmd, float rate) {
         }
     }
     
-    // Since we've disabled YouTube's autoplay, we need to be more proactive about detecting video ends
-    if (rate == 0.0f && ytlp_currentPlayerVC) {
-        // Check immediately if we're at the end
-        CGFloat total = [ytlp_currentPlayerVC currentVideoTotalMediaTime];
-        CGFloat current = [ytlp_currentPlayerVC currentVideoMediaTime];
-        
-        // Since we're forcing loop mode, we need to be more aggressive about detecting video end
-        if (total > 0 && current >= (total - 3.0)) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-                    if (ytlp_shouldAllowQueueAdvance(@"video stopped near end (loop mode)")) {
-                        ytlp_playNextFromQueue();
-                    }
-                }
-            });
-        } else {
-            // For mid-video pauses, wait longer and be more strict
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-                    if (ytlp_shouldAllowQueueAdvance(@"video paused (loop mode active)")) {
-                        ytlp_playNextFromQueue();
-                    }
-                }
-            });
-        }
-    }
+    // Forward rate change to AutoAdvanceController
+    [[YTLPAutoAdvanceController shared] handlePlaybackRateChange:rate];
 }
 
 // YouTube Autoplay hooks - Override what plays next
@@ -1811,10 +1713,20 @@ static void ytlp_startEndMonitoring(void) {
     }
     
     if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-        // Use a block-based timer - check every 0.1s for instant loop detection
-        ytlp_endCheckTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *timer) {
-            ytlp_checkVideoEnd(timer);
-        }];
+        // Use GCD dispatch timer for reliable background/PiP execution
+        dispatch_queue_t queue = dispatch_get_main_queue();
+        ytlp_dispatchTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+        if (ytlp_dispatchTimer) {
+            // Fire every 0.15 seconds (150ms)
+            dispatch_source_set_timer(ytlp_dispatchTimer, 
+                                       dispatch_time(DISPATCH_TIME_NOW, 0), 
+                                       150 * NSEC_PER_MSEC, 
+                                       50 * NSEC_PER_MSEC);
+            dispatch_source_set_event_handler(ytlp_dispatchTimer, ^{
+                ytlp_checkVideoEnd(nil);
+            });
+            dispatch_resume(ytlp_dispatchTimer);
+        }
     }
 }
 
@@ -1822,6 +1734,10 @@ static void ytlp_stopEndMonitoring(void) {
     if (ytlp_endCheckTimer) {
         [ytlp_endCheckTimer invalidate];
         ytlp_endCheckTimer = nil;
+    }
+    if (ytlp_dispatchTimer) {
+        dispatch_source_cancel(ytlp_dispatchTimer);
+        ytlp_dispatchTimer = nil;
     }
 }
 
@@ -2040,8 +1956,8 @@ static void ytlp_nextFromQueueTapped(id self, SEL _cmd, id sender) {
         return;
     }
     
-    // Play next from queue
-    ytlp_playNextFromQueue();
+    // Play next from queue using new controller
+    [[YTLPAutoAdvanceController shared] advanceToNextInQueue];
 }
 
 // Installation function
