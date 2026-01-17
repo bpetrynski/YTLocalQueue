@@ -8,9 +8,26 @@
 #import "LocalQueueViewController.h"
 
 static const NSInteger YTLocalQueueSection = 931; // unique tweak section id
+static NSString *const kYTLPVersion = @"0.0.1";
 
 static BOOL YTLP_AutoAdvanceEnabled(void) {
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"ytlp_queue_auto_advance_enabled"];
+}
+
+static BOOL YTLP_ShowPlayNextButton(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if ([defaults objectForKey:@"ytlp_show_play_next_button"] == nil) {
+        return YES; // Default: on
+    }
+    return [defaults boolForKey:@"ytlp_show_play_next_button"];
+}
+
+static BOOL YTLP_ShowQueueButton(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if ([defaults objectForKey:@"ytlp_show_queue_button"] == nil) {
+        return YES; // Default: on
+    }
+    return [defaults boolForKey:@"ytlp_show_queue_button"];
 }
 
 // Build section items via runtime to avoid hard dependencies
@@ -20,9 +37,11 @@ static NSArray *ytlp_buildSectionItems(void) {
     if (!SectionItemClass) return items;
 
     SEL selSwitch = sel_getUid("switchItemWithTitle:titleDescription:accessibilityIdentifier:switchOn:switchBlock:settingItemId:");
+    
+    // Auto advance toggle
     id enableAuto = ((id (*)(id, SEL, id, id, id, BOOL, BOOL(^)(id, BOOL), NSInteger))objc_msgSend)(
         SectionItemClass, selSwitch,
-        @"Local Queue: Auto advance",
+        @"Auto advance",
         @"Automatically play next item from local queue when video ends",
         nil,
         YTLP_AutoAdvanceEnabled(),
@@ -33,6 +52,36 @@ static NSArray *ytlp_buildSectionItems(void) {
         0
     );
     if (enableAuto) [items addObject:enableAuto];
+
+    // Show Play Next button toggle
+    id showPlayNext = ((id (*)(id, SEL, id, id, id, BOOL, BOOL(^)(id, BOOL), NSInteger))objc_msgSend)(
+        SectionItemClass, selSwitch,
+        @"Show Play Next button",
+        @"Show the Play Next button in the video player overlay",
+        nil,
+        YTLP_ShowPlayNextButton(),
+        ^BOOL(id cell, BOOL enabled) {
+            [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:@"ytlp_show_play_next_button"];
+            return YES;
+        },
+        0
+    );
+    if (showPlayNext) [items addObject:showPlayNext];
+
+    // Show Queue button toggle
+    id showQueue = ((id (*)(id, SEL, id, id, id, BOOL, BOOL(^)(id, BOOL), NSInteger))objc_msgSend)(
+        SectionItemClass, selSwitch,
+        @"Show Queue button",
+        @"Show the Queue button in the video player overlay",
+        nil,
+        YTLP_ShowQueueButton(),
+        ^BOOL(id cell, BOOL enabled) {
+            [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:@"ytlp_show_queue_button"];
+            return YES;
+        },
+        0
+    );
+    if (showQueue) [items addObject:showQueue];
 
     SEL selItem = sel_getUid("itemWithTitle:titleDescription:accessibilityIdentifier:detailTextBlock:selectBlock:");
     id openUI = ((id (*)(id, SEL, id, id, id, id, BOOL(^)(id, NSUInteger)))objc_msgSend)(
@@ -62,11 +111,36 @@ static NSArray *ytlp_buildSectionItems(void) {
         nil,
         nil,
         ^BOOL(id cell, NSUInteger arg1) {
+            NSInteger count = [[YTLPLocalQueueManager shared] allItems].count;
             [[YTLPLocalQueueManager shared] clear];
+            // Show confirmation toast
+            Class HUD = objc_getClass("GOOHUDManagerInternal");
+            Class HUDMsg = objc_getClass("YTHUDMessage");
+            if (HUD && HUDMsg) {
+                NSString *message = (count > 0) 
+                    ? [NSString stringWithFormat:@"Cleared %ld video%@", (long)count, count == 1 ? @"" : @"s"]
+                    : @"Queue is empty";
+                id hudInstance = ((id (*)(id, SEL))objc_msgSend)(HUD, sel_getUid("sharedInstance"));
+                id hudMsg = ((id (*)(id, SEL, id))objc_msgSend)(HUDMsg, sel_getUid("messageWithText:"), message);
+                if (hudInstance && hudMsg) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(hudInstance, sel_getUid("showMessageMainThread:"), hudMsg);
+                }
+            }
             return YES;
         }
     );
     if (clear) [items addObject:clear];
+
+    // Version info - use title description to show version
+    id versionItem = ((id (*)(id, SEL, id, id, id, id, BOOL(^)(id, NSUInteger)))objc_msgSend)(
+        SectionItemClass, selItem,
+        [NSString stringWithFormat:@"Version %@", kYTLPVersion],
+        nil,
+        nil,
+        nil,
+        ^BOOL(id cell, NSUInteger arg1) { return NO; }
+    );
+    if (versionItem) [items addObject:versionItem];
 
     return items;
 }
@@ -190,11 +264,9 @@ __attribute__((constructor)) static void YTLP_InstallSettingsHooks(void) {
             }
 
             if (allInstalled) {
-                NSLog(@"YTLocalQueue: Settings hooks installed successfully");
                 return;
             }
             if (--attemptsRemaining <= 0) {
-                NSLog(@"YTLocalQueue: Settings target classes not found (timed out)");
                 return;
             }
             void (^strongTryInstall)(void) = weakTryInstall;

@@ -6,6 +6,8 @@ static NSString *const kYTLPLocalQueueStorageKey = @"ytlp_local_queue_items";
 @implementation YTLPLocalQueueManager {
     dispatch_queue_t _syncQueue;
     NSMutableArray<NSDictionary *> *_items;
+    NSDictionary *_currentlyPlayingItem;
+    __weak id _currentPlayerVC;
 }
 
 + (instancetype)shared {
@@ -74,9 +76,81 @@ static NSString *const kYTLPLocalQueueStorageKey = @"ytlp_local_queue_items";
     return next;
 }
 
+- (NSDictionary *)popNextItem {
+    __block NSDictionary *next = nil;
+    dispatch_sync(_syncQueue, ^{
+        if (_items.count > 0) {
+            next = [_items.firstObject copy];
+            [_items removeObjectAtIndex:0];
+            [self persist];
+        }
+    });
+    return next;
+}
+
+- (NSString *)titleForVideoId:(NSString *)videoId {
+    if (videoId.length == 0) return nil;
+    __block NSString *title = nil;
+    dispatch_sync(_syncQueue, ^{
+        for (NSDictionary *item in _items) {
+            if ([item[@"videoId"] isEqualToString:videoId]) {
+                title = item[@"title"];
+                break;
+            }
+        }
+    });
+    return (title.length > 0) ? title : nil;
+}
+
+- (void)insertVideoId:(NSString *)videoId title:(NSString *)title atIndex:(NSUInteger)index {
+    if (videoId.length == 0) return;
+    NSDictionary *entry = @{ @"videoId": videoId, @"title": title ?: @"" };
+    dispatch_async(_syncQueue, ^{
+        NSUInteger insertIndex = (index < _items.count) ? index : _items.count;
+        [_items insertObject:entry atIndex:insertIndex];
+        [self persist];
+    });
+}
+
 - (void)persist {
     [[NSUserDefaults standardUserDefaults] setObject:[_items copy] forKey:kYTLPLocalQueueStorageKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+#pragma mark - Currently Playing
+
+- (void)setCurrentlyPlayingVideoId:(NSString *)videoId title:(NSString *)title {
+    dispatch_async(_syncQueue, ^{
+        if (videoId.length > 0) {
+            _currentlyPlayingItem = @{ @"videoId": videoId, @"title": title ?: @"" };
+        } else {
+            _currentlyPlayingItem = nil;
+        }
+    });
+}
+
+- (NSDictionary *)currentlyPlayingItem {
+    __block NSDictionary *item = nil;
+    dispatch_sync(_syncQueue, ^{
+        item = [_currentlyPlayingItem copy];
+    });
+    return item;
+}
+
+#pragma mark - Player Reference
+
+- (void)setCurrentPlayerViewController:(id)playerVC {
+    dispatch_async(_syncQueue, ^{
+        _currentPlayerVC = playerVC;
+    });
+}
+
+- (id)currentPlayerViewController {
+    __block id playerVC = nil;
+    dispatch_sync(_syncQueue, ^{
+        playerVC = _currentPlayerVC;
+    });
+    return playerVC;
 }
 
 @end
