@@ -28,39 +28,41 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Local Queue";
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemEdit target:self action:@selector(toggleEditing)];
     self.clearButton = [[UIBarButtonItem alloc] initWithTitle:@"Clear" style:UIBarButtonItemStylePlain target:self action:@selector(clearQueue)];
+    UIBarButtonItem *doneButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(dismissController)];
     self.navigationItem.leftBarButtonItem = self.clearButton;
+    self.navigationItem.rightBarButtonItems = @[doneButton, self.editButtonItem];
     self.tableView.allowsSelectionDuringEditing = YES;
-    self.tableView.rowHeight = 70; // Reduced height for better thumbnail fit
+    self.tableView.rowHeight = 70;
     self.tableView.sectionHeaderHeight = 32;
     self.thumbnailCache = [NSMutableDictionary dictionary];
-    
-    // Use dark separator for dark mode compatibility
     self.tableView.separatorColor = [UIColor separatorColor];
+}
+
+- (void)dismissController {
+    [self dismissViewControllerAnimated:YES completion:nil];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    
-    // Actively fetch the currently playing video from the player
+
+    NSIndexPath *selectedIndexPath = [self.tableView indexPathForSelectedRow];
+    if (selectedIndexPath) {
+        [self.tableView deselectRowAtIndexPath:selectedIndexPath animated:NO];
+    }
+
     [self updateCurrentlyPlayingFromPlayer];
-    
     [self.tableView reloadData];
 }
 
 - (void)updateCurrentlyPlayingFromPlayer {
-    // Try to get the current video from the player
     NSString *videoId = nil;
     NSString *title = nil;
-    
-    // First, try the stored player reference from the manager
+
     id playerVC = [[YTLPLocalQueueManager shared] currentPlayerViewController];
-    
-    // If no stored reference, search the view hierarchy
+
     if (!playerVC) {
         UIViewController *rootVC = nil;
-        // Get key window in a way that works with scenes
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (scene.activationState == UISceneActivationStateForegroundActive) {
                 for (UIWindow *window in scene.windows) {
@@ -76,16 +78,14 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
             playerVC = [self findPlayerViewControllerFrom:rootVC];
         }
     }
-    
+
     if (playerVC) {
         @try {
-            // Get video ID using performSelector
             SEL currentVideoIDSel = NSSelectorFromString(@"currentVideoID");
             if ([playerVC respondsToSelector:currentVideoIDSel]) {
                 videoId = ((id (*)(id, SEL))objc_msgSend)(playerVC, currentVideoIDSel);
             }
-            
-            // Try to get title from activeVideo
+
             SEL activeVideoSel = NSSelectorFromString(@"activeVideo");
             if (videoId.length > 0 && [playerVC respondsToSelector:activeVideoSel]) {
                 id activeVideo = ((id (*)(id, SEL))objc_msgSend)(playerVC, activeVideoSel);
@@ -93,7 +93,6 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
                 if (activeVideo && [activeVideo respondsToSelector:singleVideoSel]) {
                     id singleVideo = ((id (*)(id, SEL))objc_msgSend)(activeVideo, singleVideoSel);
                     if (singleVideo) {
-                        // Try title property
                         SEL titleSel = NSSelectorFromString(@"title");
                         if ([singleVideo respondsToSelector:titleSel]) {
                             id titleObj = ((id (*)(id, SEL))objc_msgSend)(singleVideo, titleSel);
@@ -110,26 +109,21 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
                 }
             }
         } @catch (NSException *e) {
-            // Ignore
         }
     }
-    
-    // Try to get title from queue manager if we have video ID but no title
+
     if (videoId.length > 0 && title.length == 0) {
         title = [[YTLPLocalQueueManager shared] titleForVideoId:videoId];
     }
-    
-    // Update the manager if we found a video
+
     if (videoId.length > 0) {
         [[YTLPLocalQueueManager shared] setCurrentlyPlayingVideoId:videoId title:title];
-        
-        // If we still don't have a title, fetch it asynchronously
+
         if (title.length == 0) {
             NSString *capturedVideoId = [videoId copy];
             [self fetchTitleForVideoId:capturedVideoId completion:^(NSString *fetchedTitle) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (fetchedTitle.length > 0) {
-                        // Update the currently playing item with the fetched title
                         NSDictionary *currentItem = [[YTLPLocalQueueManager shared] currentlyPlayingItem];
                         if (currentItem && [currentItem[@"videoId"] isEqualToString:capturedVideoId]) {
                             [[YTLPLocalQueueManager shared] setCurrentlyPlayingVideoId:capturedVideoId title:fetchedTitle];
@@ -144,26 +138,22 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
 
 - (id)findPlayerViewControllerFrom:(UIViewController *)viewController {
     if (!viewController) return nil;
-    
-    // Check if this is a player view controller
+
     Class PlayerVCClass = objc_getClass("YTPlayerViewController");
     if (PlayerVCClass && [viewController isKindOfClass:PlayerVCClass]) {
         return viewController;
     }
-    
-    // Check presented view controller
+
     if (viewController.presentedViewController) {
         id found = [self findPlayerViewControllerFrom:viewController.presentedViewController];
         if (found) return found;
     }
-    
-    // Check child view controllers
+
     for (UIViewController *child in viewController.childViewControllers) {
         id found = [self findPlayerViewControllerFrom:child];
         if (found) return found;
     }
-    
-    // Check navigation controller's view controllers
+
     if ([viewController isKindOfClass:[UINavigationController class]]) {
         UINavigationController *nav = (UINavigationController *)viewController;
         for (UIViewController *vc in nav.viewControllers) {
@@ -171,8 +161,7 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
             if (found) return found;
         }
     }
-    
-    // Check tab bar controller's view controllers
+
     if ([viewController isKindOfClass:[UITabBarController class]]) {
         UITabBarController *tab = (UITabBarController *)viewController;
         for (UIViewController *vc in tab.viewControllers) {
@@ -180,20 +169,15 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
             if (found) return found;
         }
     }
-    
-    return nil;
-}
 
-- (void)toggleEditing {
-    [self setEditing:!self.isEditing animated:YES];
+    return nil;
 }
 
 - (void)clearQueue {
     NSInteger count = [[YTLPLocalQueueManager shared] allItems].count;
     [[YTLPLocalQueueManager shared] clear];
     [self.tableView reloadData];
-    
-    // Show confirmation toast
+
     Class HUD = objc_getClass("GOOHUDManagerInternal");
     Class HUDMsg = objc_getClass("YTHUDMessage");
     if (HUD && HUDMsg) {
@@ -211,7 +195,7 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
 #pragma mark - DataSource
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return 2; // Now Playing + Up Next
+    return 2;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -239,88 +223,82 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
         cell.textLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
         cell.detailTextLabel.numberOfLines = 1;
         cell.detailTextLabel.font = [UIFont systemFontOfSize:11];
-        cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-        
-        // Configure imageView for proper thumbnail display
         cell.imageView.contentMode = UIViewContentModeScaleAspectFill;
         cell.imageView.clipsToBounds = YES;
         cell.imageView.layer.cornerRadius = 4;
     }
-    
-    // Reset cell state for reuse
+
+    BOOL isNowPlaying = (indexPath.section == YTLPQueueSectionNowPlaying);
+
+    // Reset cell state completely for reuse - BEFORE setting new values
     cell.selected = NO;
     cell.highlighted = NO;
-    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-    
+    cell.accessoryView = nil;
+    cell.accessoryType = UITableViewCellAccessoryNone;
+
+    // Apply background and selection style based on section
+    if (isNowPlaying) {
+        cell.backgroundColor = [[UIColor systemRedColor] colorWithAlphaComponent:0.15];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.accessoryView = [self nowPlayingIndicator];
+    } else {
+        cell.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    }
+
     NSDictionary *item;
-    BOOL isNowPlaying = (indexPath.section == YTLPQueueSectionNowPlaying);
-    
     if (isNowPlaying) {
         item = [YTLPLocalQueueManager.shared currentlyPlayingItem];
     } else {
         item = [YTLPLocalQueueManager.shared allItems][indexPath.row];
     }
-    
+
     NSString *title = item[@"title"] ?: @"";
     NSString *videoId = item[@"videoId"] ?: @"";
-    
-    // Configure text
-    if (title.length > 0) {
-        cell.textLabel.text = title;
-        if (isNowPlaying) {
-            cell.detailTextLabel.text = @"▶ Playing now";
-            cell.detailTextLabel.textColor = [UIColor systemRedColor];
-        } else {
-            cell.detailTextLabel.text = videoId;
-            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-        }
+    NSString *channelName = item[@"channelName"] ?: @"";
+
+    cell.textLabel.text = title.length > 0 ? title : @"Loading...";
+    if (isNowPlaying) {
+        cell.detailTextLabel.text = @"Playing now";
+        cell.detailTextLabel.textColor = [UIColor systemRedColor];
     } else {
-        cell.textLabel.text = @"Loading...";
-        cell.detailTextLabel.text = videoId;
+        cell.detailTextLabel.text = channelName.length > 0 ? channelName : @"";
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-        
+    }
+
+    // Fetch metadata if title OR channel name is missing
+    if (title.length == 0 || (!isNowPlaying && channelName.length == 0)) {
         NSString *capturedVideoId = [videoId copy];
+        NSString *capturedTitle = [title copy];
         BOOL capturedIsNowPlaying = isNowPlaying;
-        
-        [self fetchTitleForVideoId:capturedVideoId completion:^(NSString *fetchedTitle) {
+
+        [self fetchMetadataForVideoId:capturedVideoId completion:^(NSString *fetchedTitle, NSString *fetchedChannel) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (fetchedTitle && fetchedTitle.length > 0) {
-                    // Update the appropriate item based on section
+                NSString *finalTitle = (fetchedTitle.length > 0) ? fetchedTitle : capturedTitle;
+                if (finalTitle.length > 0 || fetchedChannel.length > 0) {
                     if (capturedIsNowPlaying) {
-                        [[YTLPLocalQueueManager shared] setCurrentlyPlayingVideoId:capturedVideoId title:fetchedTitle];
+                        [[YTLPLocalQueueManager shared] setCurrentlyPlayingVideoId:capturedVideoId title:finalTitle channelName:fetchedChannel];
                     } else {
-                        [[YTLPLocalQueueManager shared] updateTitleForVideoId:capturedVideoId title:fetchedTitle];
+                        [[YTLPLocalQueueManager shared] updateMetadataForVideoId:capturedVideoId title:finalTitle channelName:fetchedChannel];
                     }
-                    
+
                     UITableViewCell *updateCell = [tableView cellForRowAtIndexPath:indexPath];
                     if (updateCell) {
-                        updateCell.textLabel.text = fetchedTitle;
-                        if (capturedIsNowPlaying) {
-                            updateCell.detailTextLabel.text = @"▶ Playing now";
-                            updateCell.detailTextLabel.textColor = [UIColor systemRedColor];
+                        updateCell.textLabel.text = finalTitle.length > 0 ? finalTitle : [NSString stringWithFormat:@"Video %@", capturedVideoId];
+                        if (!capturedIsNowPlaying) {
+                            updateCell.detailTextLabel.text = fetchedChannel ?: @"";
                         }
                     }
                 } else {
                     UITableViewCell *updateCell = [tableView cellForRowAtIndexPath:indexPath];
-                    if (updateCell) {
+                    if (updateCell && capturedTitle.length == 0) {
                         updateCell.textLabel.text = [NSString stringWithFormat:@"Video %@", capturedVideoId];
                     }
                 }
             });
         }];
     }
-    
-    // Add playing indicator for now playing section
-    if (isNowPlaying) {
-        cell.accessoryView = [self nowPlayingIndicator];
-        cell.backgroundColor = [[UIColor systemRedColor] colorWithAlphaComponent:0.08];
-        cell.selectionStyle = UITableViewCellSelectionStyleNone; // Can't tap now playing
-    } else {
-        cell.accessoryView = nil;
-        cell.backgroundColor = nil;
-        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-    }
-    
+
     // Configure thumbnail
     UIImage *cachedThumbnail = self.thumbnailCache[videoId];
     if (cachedThumbnail) {
@@ -340,41 +318,44 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
             });
         }];
     }
-    
-    cell.showsReorderControl = !isNowPlaying;
-    
+
     return cell;
 }
 
 - (UIView *)nowPlayingIndicator {
     UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 24, 24)];
-    
-    // Create equalizer-style bars
+
     CGFloat barWidth = 3;
     CGFloat spacing = 2;
     CGFloat heights[] = {12, 18, 10, 16};
     UIColor *barColor = [UIColor systemRedColor];
-    
+
     for (int i = 0; i < 4; i++) {
         UIView *bar = [[UIView alloc] init];
         bar.backgroundColor = barColor;
         bar.layer.cornerRadius = barWidth / 2;
-        
+
         CGFloat x = i * (barWidth + spacing);
         CGFloat height = heights[i];
         CGFloat y = (24 - height) / 2;
         bar.frame = CGRectMake(x, y, barWidth, height);
-        
+
         [container addSubview:bar];
     }
-    
+
     return container;
 }
 
 #pragma mark - Editing
 
+- (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.section == YTLPQueueSectionUpNext) {
+        return UITableViewCellEditingStyleDelete;
+    }
+    return UITableViewCellEditingStyleNone;
+}
+
 - (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
-    // Can't edit now playing section
     return indexPath.section == YTLPQueueSectionUpNext;
 }
 
@@ -383,7 +364,6 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
 }
 
 - (NSIndexPath *)tableView:(UITableView *)tableView targetIndexPathForMoveFromRowAtIndexPath:(NSIndexPath *)sourceIndexPath toProposedIndexPath:(NSIndexPath *)proposedDestinationIndexPath {
-    // Keep moves within Up Next section only
     if (proposedDestinationIndexPath.section != YTLPQueueSectionUpNext) {
         return [NSIndexPath indexPathForRow:0 inSection:YTLPQueueSectionUpNext];
     }
@@ -405,16 +385,15 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    
-    // Don't allow tapping currently playing video
+
     if (indexPath.section == YTLPQueueSectionNowPlaying) {
         return;
     }
-    
+
     NSDictionary *item = [YTLPLocalQueueManager.shared allItems][indexPath.row];
     NSString *videoId = item[@"videoId"];
     if (videoId.length == 0) return;
-    
+
     Class YTICommandClass = objc_getClass("YTICommand");
     if (YTICommandClass && [YTICommandClass respondsToSelector:@selector(watchNavigationEndpointWithVideoID:)]) {
         id command = [YTICommandClass watchNavigationEndpointWithVideoID:videoId];
@@ -427,7 +406,7 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
             }
         }
     }
-    
+
     NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"youtube://watch?v=%@", videoId]];
     Class UIUtils = objc_getClass("YTUIUtils");
     if (UIUtils && [UIUtils canOpenURL:url]) {
@@ -438,33 +417,31 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
 #pragma mark - Thumbnail Methods
 
 - (UIImage *)placeholderImage {
-    CGSize size = CGSizeMake(88, 50); // 16:9 aspect ratio
+    CGSize size = CGSizeMake(88, 50);
     UIGraphicsBeginImageContextWithOptions(size, YES, 0);
     CGContextRef context = UIGraphicsGetCurrentContext();
-    
-    // Dark background that works in both light and dark mode
+
     [[UIColor colorWithWhite:0.15 alpha:1.0] setFill];
     CGContextFillRect(context, CGRectMake(0, 0, size.width, size.height));
-    
-    // Draw play icon
+
     [[UIColor colorWithWhite:0.4 alpha:1.0] setFill];
     CGFloat centerX = size.width / 2;
     CGFloat centerY = size.height / 2;
     CGFloat triangleSize = 14;
-    
+
     CGMutablePathRef trianglePath = CGPathCreateMutable();
     CGPathMoveToPoint(trianglePath, NULL, centerX - triangleSize/2, centerY - triangleSize/2);
     CGPathAddLineToPoint(trianglePath, NULL, centerX + triangleSize/2, centerY);
     CGPathAddLineToPoint(trianglePath, NULL, centerX - triangleSize/2, centerY + triangleSize/2);
     CGPathCloseSubpath(trianglePath);
-    
+
     CGContextAddPath(context, trianglePath);
     CGContextFillPath(context);
     CGPathRelease(trianglePath);
-    
+
     UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
-    
+
     return image;
 }
 
@@ -473,13 +450,13 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
         completion(nil);
         return;
     }
-    
+
     NSArray *thumbnailURLs = @[
         [NSString stringWithFormat:@"https://img.youtube.com/vi/%@/mqdefault.jpg", videoId],
         [NSString stringWithFormat:@"https://img.youtube.com/vi/%@/hqdefault.jpg", videoId],
         [NSString stringWithFormat:@"https://img.youtube.com/vi/%@/default.jpg", videoId]
     ];
-    
+
     [self loadThumbnailFromURLs:thumbnailURLs currentIndex:0 completion:completion];
 }
 
@@ -488,10 +465,10 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
         completion(nil);
         return;
     }
-    
+
     NSString *urlString = urls[index];
     NSURL *url = [NSURL URLWithString:urlString];
-    
+
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (data && !error) {
             UIImage *image = [UIImage imageWithData:data];
@@ -503,62 +480,63 @@ typedef NS_ENUM(NSInteger, YTLPQueueSection) {
         }
         [self loadThumbnailFromURLs:urls currentIndex:index + 1 completion:completion];
     }];
-    
+
     [task resume];
 }
 
 - (UIImage *)resizeImage:(UIImage *)image toSize:(CGSize)newSize {
-    // Use aspect fill and clip - no letterboxing/pillarboxing
     CGFloat aspectRatio = image.size.width / image.size.height;
     CGFloat targetAspectRatio = newSize.width / newSize.height;
-    
+
     CGRect drawRect;
     if (aspectRatio > targetAspectRatio) {
-        // Image is wider - crop sides
         CGFloat drawHeight = newSize.height;
         CGFloat drawWidth = drawHeight * aspectRatio;
         CGFloat offsetX = (newSize.width - drawWidth) / 2;
         drawRect = CGRectMake(offsetX, 0, drawWidth, drawHeight);
     } else {
-        // Image is taller - crop top/bottom
         CGFloat drawWidth = newSize.width;
         CGFloat drawHeight = drawWidth / aspectRatio;
         CGFloat offsetY = (newSize.height - drawHeight) / 2;
         drawRect = CGRectMake(0, offsetY, drawWidth, drawHeight);
     }
-    
+
     UIGraphicsBeginImageContextWithOptions(newSize, YES, 0.0);
-    
-    // No background fill needed - image fills entire rect
     [image drawInRect:drawRect];
-    
     UIImage *resizedImage = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     return resizedImage;
 }
 
 - (void)fetchTitleForVideoId:(NSString *)videoId completion:(void (^)(NSString *title))completion {
+    [self fetchMetadataForVideoId:videoId completion:^(NSString *title, NSString *channelName) {
+        completion(title);
+    }];
+}
+
+- (void)fetchMetadataForVideoId:(NSString *)videoId completion:(void (^)(NSString *title, NSString *channelName))completion {
     if (!videoId || videoId.length == 0) {
-        completion(nil);
+        completion(nil, nil);
         return;
     }
-    
+
     NSString *urlString = [NSString stringWithFormat:@"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=%@&format=json", videoId];
     NSURL *url = [NSURL URLWithString:urlString];
-    
+
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (data && !error) {
             NSError *jsonError;
             NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
             if (json && !jsonError) {
                 NSString *title = json[@"title"];
-                completion(title);
+                NSString *channelName = json[@"author_name"];
+                completion(title, channelName);
                 return;
             }
         }
-        completion(nil);
+        completion(nil, nil);
     }];
-    
+
     [task resume];
 }
 

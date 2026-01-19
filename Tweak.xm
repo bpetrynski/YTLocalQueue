@@ -5,6 +5,7 @@
 #import <objc/message.h>
 
 #import "Headers/YouTubeHeader/YTPlayerViewController.h"
+#import <MediaPlayer/MediaPlayer.h>
 #import "Headers/YouTubeHeader/YTMainAppVideoPlayerOverlayViewController.h"
 #import "Headers/YouTubeHeader/YTMainAppVideoPlayerOverlayView.h"
 #import "Headers/YouTubeHeader/YTMainAppControlsOverlayView.h"
@@ -18,7 +19,7 @@
 #import "Headers/YouTubeHeader/YTIMenuItemSupportedRenderers.h"
 #import "Headers/YouTubeHeader/YTIMenuNavigationItemRenderer.h"
 #import "Headers/YouTubeHeader/YTIButtonRenderer.h"
-#import "Headers/YouTubeHeader/YTIcon.h"
+//#import "Headers/YouTubeHeader/YTIcon.h" // File doesn't exist, not needed (we draw our own icons)
 #import "Headers/YouTubeHeader/YTIMenuItemSupportedRenderersElementRendererCompatibilityOptionsExtension.h"
 #import "Headers/YouTubeHeader/YTIMenuConditionalServiceItemRenderer.h"
 #import "Headers/YouTubeHeader/YTActionSheetAction.h"
@@ -38,19 +39,34 @@
 
 // Associated-object keys used across this file (only needed if we add advanced thumbnail injection)
 
+// ============================================================================
+// STATE MANAGEMENT FOR AUTO-ADVANCE
+// ============================================================================
+
+typedef enum : NSInteger {
+    YTLPStateIdle = 0,              // Nothing happening
+    YTLPStatePlaying,               // Video playing normally
+    YTLPStateNearEnd,               // Within 5s of end
+    YTLPStateEnded,                 // Video has ended
+    YTLPStateTransitioning,         // We initiated navigation to next video
+    YTLPStateWaitingForLoad,        // Waiting for new video to load
+    YTLPStateUserPaused             // User paused, don't auto-advance
+} YTLPAdvanceState;
+
+// Current state
+static YTLPAdvanceState ytlp_advanceState = YTLPStateIdle;
+
 // Track last known player VC
 static __weak YTPlayerViewController *ytlp_currentPlayerVC = nil;
-static NSTimeInterval ytlp_lastQueueAdvanceTime = 0;
-static NSString *ytlp_lastPlayedVideoId = nil;
-static NSTimer *ytlp_endCheckTimer = nil;
-static CGFloat ytlp_lastKnownPosition = 0;
-static CGFloat ytlp_lastKnownTotal = 0;
+static __weak id ytlp_currentWatchPlaybackController = nil;
+static __weak id ytlp_currentAutonavController = nil;
 
-// Time change tracking for loop detection (from singleVideo:currentVideoTimeDidChange:)
-static CGFloat ytlp_lastTimeChangePosition = 0;
-static CGFloat ytlp_lastTimeChangeTotal = 0;
-static CGFloat ytlp_maxPositionSeen = 0;  // Track max position to detect loops after scrubbing
-static BOOL ytlp_playbackStarted = NO;    // TRUE once we've seen position > 1 second
+// Timing and cooldown tracking
+static NSTimeInterval ytlp_lastQueueAdvanceTime = 0;
+static NSTimeInterval ytlp_lastStateChangeTime = 0;
+static NSString *ytlp_lastPlayedVideoId = nil;
+static NSString *ytlp_currentPlayingVideoId = nil;
+static NSTimer *ytlp_endCheckTimer = nil;
 
 // Store the last tapped video info for menu operations
 static NSString *ytlp_lastTappedVideoId = nil;
@@ -59,6 +75,14 @@ static NSTimeInterval ytlp_lastTapTime = 0;
 static NSString *ytlp_lastMenuContextVideoId = nil;
 static NSString *ytlp_lastMenuContextTitle = nil;
 static NSTimeInterval ytlp_lastMenuContextTime = 0;
+
+// Track last known playback position for scrubbing/loop detection
+static CGFloat ytlp_lastTimeChangePosition = 0;
+
+// Flags to prevent duplicate triggers
+static BOOL ytlp_advanceInProgress = NO;
+static BOOL ytlp_endDetected = NO;
+static BOOL ytlp_userInitiated = NO;
 
 static BOOL YTLP_AutoAdvanceEnabled(void) {
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"ytlp_queue_auto_advance_enabled"];
@@ -82,8 +106,7 @@ static BOOL YTLP_ShowQueueButton(void) {
 
 // Forward declarations
 static void ytlp_updateAutoplayState(void);
-static void ytlp_startEndMonitoring(void);
-static void ytlp_stopEndMonitoring(void);
+static void ytlp_setupRemoteCommands(void);
 static void ytlp_captureVideoTap(id view, NSString *videoId, NSString *title);
 
 // Interface for YTAutoplayAutonavController (like YouLoop declares)
@@ -100,6 +123,18 @@ static void ytlp_captureVideoTap(id view, NSString *videoId, NSString *title);
 
 @interface YTICommand (YTLocalQueue)
 + (id)watchNavigationEndpointWithVideoID:(NSString *)videoId;
+@end
+
+// Forward declarations for YTHUDMessage
+@interface YTHUDMessage : NSObject
++ (id)messageWithText:(NSString *)text;
+@end
+
+// Forward declarations for video objects
+@interface NSObject (YTLocalQueueVideoHelpers)
+- (id)singleVideo;
+- (NSString *)videoID;
+- (id)videoData;
 @end
 
 // Overlay button size (matches YTVideoOverlay)
@@ -190,52 +225,200 @@ static void ytlp_fetchTitleForVideoId(NSString *videoId, void (^completion)(NSSt
     [task resume];
 }
 
-// Simple cooldown check for loop interceptions - the loop itself proves video ended
-static BOOL ytlp_shouldAllowLoopIntercept(void) {
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    // Only check cooldown - if YouTube is trying to loop, the video definitely ended
-    return (now - ytlp_lastQueueAdvanceTime >= 3.0);
+// ============================================================================
+// STATE CHANGE HELPERS
+// ============================================================================
+
+static void ytlp_setState(YTLPAdvanceState newState, NSString *reason) {
+    if (ytlp_advanceState != newState) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] State: %ld -> %ld (%@)", (long)ytlp_advanceState, (long)newState, reason);
+        #endif
+        ytlp_advanceState = newState;
+        ytlp_lastStateChangeTime = [[NSDate date] timeIntervalSince1970];
+    }
 }
 
+static void ytlp_resetState(NSString *reason) {
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] Reset state: %@", reason);
+    #endif
+    ytlp_setState(YTLPStateIdle, reason);
+    ytlp_advanceInProgress = NO;
+    ytlp_endDetected = NO;
+    ytlp_userInitiated = NO;
+}
+
+// ============================================================================
+// SMART ADVANCE DECISION LOGIC
+// ============================================================================
+
 static BOOL ytlp_shouldAllowQueueAdvance(NSString *reason) {
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    
-    // Check cooldown period (minimum 5 seconds between advances since we're using loop mode)
-    if (now - ytlp_lastQueueAdvanceTime < 5.0) {
+    // Auto-advance must be enabled
+    if (!YTLP_AutoAdvanceEnabled()) {
         return NO;
     }
-    
-    // Check if current video has played for at least 15 seconds OR is near the end
+
+    // Queue must not be empty
+    if ([[YTLPLocalQueueManager shared] isEmpty]) {
+        return NO;
+    }
+
+    // If advance is already in progress, don't trigger again
+    if (ytlp_advanceInProgress) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] Blocked: advance already in progress");
+        #endif
+        return NO;
+    }
+
+    // If we're already transitioning or waiting, don't trigger again
+    if (ytlp_advanceState == YTLPStateTransitioning || ytlp_advanceState == YTLPStateWaitingForLoad) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] Blocked: state is %ld", (long)ytlp_advanceState);
+        #endif
+        return NO;
+    }
+
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+
+    // Cooldown check - reduced to 2 seconds for better responsiveness
+    NSTimeInterval cooldownTime = ytlp_userInitiated ? 1.0 : 2.0;
+    if (now - ytlp_lastQueueAdvanceTime < cooldownTime) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] Blocked: cooldown (%.1fs remaining)", cooldownTime - (now - ytlp_lastQueueAdvanceTime));
+        #endif
+        return NO;
+    }
+
+    // Check current video state
     if (ytlp_currentPlayerVC) {
+        NSString *currentVideoId = [ytlp_currentPlayerVC currentVideoID];
         CGFloat currentTime = [ytlp_currentPlayerVC currentVideoMediaTime];
         CGFloat totalTime = [ytlp_currentPlayerVC currentVideoTotalMediaTime];
-        
-        // If we're near the end (within 5 seconds), always allow - video is about to end/loop
-        BOOL nearEnd = (totalTime > 0 && currentTime >= (totalTime - 5.0));
-        
-        // If not near end and haven't played for at least 15 seconds, block
-        // This prevents advancing when video just started
-        if (!nearEnd && currentTime < 15.0) {
-            return NO;
+
+        // If this is the same video as last advance attempt, and we haven't moved far, block
+        if (ytlp_lastPlayedVideoId && [currentVideoId isEqualToString:ytlp_lastPlayedVideoId]) {
+            if (currentTime < 10.0) {
+                #if DEBUG
+                NSLog(@"[YTLocalQueue] Blocked: same video as last advance (%.1fs)", currentTime);
+                #endif
+                return NO;
+            }
         }
-        
-        // If we're not near the end and video is still playing, block
-        if (!nearEnd && totalTime > 0 && currentTime < (totalTime - 5.0)) {
-            return NO;
+
+        // Check if we're actually near the end or user initiated
+        BOOL nearEnd = (totalTime > 0 && currentTime >= (totalTime - 5.0));
+        BOOL atEnd = (totalTime > 0 && currentTime >= (totalTime - 1.0));
+
+        // Allow if:
+        // - At the very end (< 1s remaining)
+        // - Near end AND end was detected
+        // - User initiated (button press)
+        if (!atEnd && !ytlp_userInitiated && !(nearEnd && ytlp_endDetected)) {
+            // Video is still playing normally, not at end
+            if (currentTime < 10.0) {
+                #if DEBUG
+                NSLog(@"[YTLocalQueue] Blocked: video just started (%.1fs)", currentTime);
+                #endif
+                return NO;
+            }
         }
     }
-    
+
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] ✓ Allowing advance: %@", reason);
+    #endif
     return YES;
 }
 
+// ============================================================================
+// PLAY NEXT FROM QUEUE (Core Navigation Function)
+// ============================================================================
+
+// Play next video in background without waking screen
+// Triggers YouTube's native autonav which uses our hooked endpoint
+static BOOL ytlp_playNextInBackground(void) {
+    if (!ytlp_currentAutonavController) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] No autonav controller available");
+        #endif
+        return NO;
+    }
+
+    if ([[YTLPLocalQueueManager shared] isEmpty]) {
+        return NO;
+    }
+
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] Triggering native autonav for background playback");
+    #endif
+
+    // Trigger YouTube's native autonav - our hooks will:
+    // 1. autonavEndpoint returns queue video
+    // 2. playNext/playAutonav consumes queue item
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SEL playNextSel = @selector(playNext);
+        SEL playAutonavSel = @selector(playAutonav);
+
+        if ([ytlp_currentAutonavController respondsToSelector:playNextSel]) {
+            ((void (*)(id, SEL))objc_msgSend)(ytlp_currentAutonavController, playNextSel);
+        } else if ([ytlp_currentAutonavController respondsToSelector:playAutonavSel]) {
+            ((void (*)(id, SEL))objc_msgSend)(ytlp_currentAutonavController, playAutonavSel);
+        }
+    });
+
+    return YES;
+}
+
+// Check if app is in background
+static BOOL ytlp_isAppInBackground(void) {
+    __block BOOL isBackground = NO;
+    if ([NSThread isMainThread]) {
+        isBackground = ([UIApplication sharedApplication].applicationState != UIApplicationStateActive);
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            isBackground = ([UIApplication sharedApplication].applicationState != UIApplicationStateActive);
+        });
+    }
+    return isBackground;
+}
+
 static void ytlp_playNextFromQueue(void) {
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] === playNextFromQueue called ===");
+    #endif
+
+    // If in background, try to use direct player transition to avoid waking screen
+    if (ytlp_isAppInBackground()) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] App in background, trying direct player transition");
+        #endif
+        if (ytlp_playNextInBackground()) {
+            return;
+        }
+        // If background transition failed, fall through to navigation method
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] Background transition failed, falling back to navigation");
+        #endif
+    }
+
+    // Set advance in progress flag
+    ytlp_advanceInProgress = YES;
+    ytlp_setState(YTLPStateTransitioning, @"playNextFromQueue");
+
     NSDictionary *nextItem = [[YTLPLocalQueueManager shared] popNextItem];
     NSString *nextId = nextItem[@"videoId"];
     NSString *nextTitle = nextItem[@"title"];
-    
+
     if (nextId.length == 0) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] Queue is now empty");
+        #endif
         // Queue is now empty, update autoplay state to re-enable YouTube's autoplay
         ytlp_updateAutoplayState();
+        ytlp_resetState(@"queue empty");
+
         // Notify user that queue is complete
         Class HUD = objc_getClass("GOOHUDManagerInternal");
         Class HUDMsg = objc_getClass("YTHUDMessage");
@@ -244,67 +427,152 @@ static void ytlp_playNextFromQueue(void) {
         }
         return;
     }
-    
+
     // Store the video we're leaving from (for navigation failure detection)
     NSString *previousVideoId = ytlp_currentPlayerVC ? [ytlp_currentPlayerVC currentVideoID] : nil;
-    
+
     // Update tracking variables
     ytlp_lastQueueAdvanceTime = [[NSDate date] timeIntervalSince1970];
-    // IMPORTANT: Set lastPlayedVideoId to the NEXT video we're navigating to, not the current one.
-    // This prevents the "same video" check from blocking when the loop fires again before navigation completes.
     ytlp_lastPlayedVideoId = nextId;
-    
+    ytlp_currentPlayingVideoId = nextId;
+
     // Update currently playing for the Local Queue view
     [[YTLPLocalQueueManager shared] setCurrentlyPlayingVideoId:nextId title:nextTitle];
-    
-    // Reset position tracking to prevent false loop detection on new video
-    ytlp_lastKnownPosition = 0;
-    ytlp_lastKnownTotal = 0;
-    ytlp_lastTimeChangePosition = 0;
-    ytlp_lastTimeChangeTotal = 0;
-    ytlp_maxPositionSeen = 0;
-    ytlp_playbackStarted = NO;
-    
+
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] Navigating: %@ -> %@", previousVideoId ?: @"(unknown)", nextId);
+    #endif
+
     // Schedule a check to detect navigation failure and re-add video to queue if needed
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (ytlp_currentPlayerVC) {
             NSString *currentVideoId = [ytlp_currentPlayerVC currentVideoID];
             // If we're still on the previous video (not the one we tried to navigate to),
             // navigation probably failed - re-add the video to the front of the queue
             if (previousVideoId && [currentVideoId isEqualToString:previousVideoId] && ![currentVideoId isEqualToString:nextId]) {
+                #if DEBUG
+                NSLog(@"[YTLocalQueue] Navigation failed, re-adding video to queue");
+                #endif
                 [[YTLPLocalQueueManager shared] insertVideoId:nextId title:nextTitle atIndex:0];
+                ytlp_resetState(@"navigation failed");
+
                 Class HUD = objc_getClass("GOOHUDManagerInternal");
                 Class HUDMsg = objc_getClass("YTHUDMessage");
                 if (HUD && HUDMsg) {
-                    [[HUD sharedInstance] showMessageMainThread:[HUDMsg messageWithText:@"Navigation failed, video re-added to queue"]];
+                    [[HUD sharedInstance] showMessageMainThread:[HUDMsg messageWithText:@"⚠ Navigation failed, video re-added"]];
                 }
+            } else if ([currentVideoId isEqualToString:nextId]) {
+                // Successfully navigated
+                ytlp_setState(YTLPStateWaitingForLoad, @"navigation success");
+                ytlp_advanceInProgress = NO;
+                ytlp_userInitiated = NO;
+
+                // Reset state after video loads
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    ytlp_resetState(@"video loaded");
+                });
             }
         }
     });
-    
-    // Show toast with video title or ID
+
+    // Show toast with video title or ID (only if app is in foreground)
+    if (!ytlp_isAppInBackground()) {
+        Class HUD = objc_getClass("GOOHUDManagerInternal");
+        Class HUDMsg = objc_getClass("YTHUDMessage");
+        if (HUD && HUDMsg) {
+            NSInteger remaining = [[YTLPLocalQueueManager shared] allItems].count;
+            NSString *displayName = (nextTitle.length > 0) ? nextTitle : nextId;
+            if (displayName.length > 40) displayName = [[displayName substringToIndex:37] stringByAppendingString:@"..."];
+            NSString *message = (remaining > 0)
+                ? [NSString stringWithFormat:@"▶ %@ (%ld more)", displayName, (long)remaining]
+                : [NSString stringWithFormat:@"▶ %@ (last)", displayName];
+            [[HUD sharedInstance] showMessageMainThread:[HUDMsg messageWithText:message]];
+        }
+    }
+
+    // Navigate using YouTube's command system
+    Class YTICommandClass = objc_getClass("YTICommand");
+    if (YTICommandClass && [YTICommandClass respondsToSelector:@selector(watchNavigationEndpointWithVideoID:)]) {
+        id cmd = [YTICommandClass watchNavigationEndpointWithVideoID:nextId];
+        Class Handler = objc_getClass("YTCoWatchWatchEndpointWrapperCommandHandler");
+        if (Handler) {
+            id handler = [[Handler alloc] init];
+            if ([handler respondsToSelector:@selector(sendOriginalCommandWithNavigationEndpoint:fromView:entry:sender:completionBlock:)]) {
+                #if DEBUG
+                NSLog(@"[YTLocalQueue] Using YTCoWatchWatchEndpointWrapperCommandHandler");
+                #endif
+                [handler sendOriginalCommandWithNavigationEndpoint:cmd fromView:nil entry:nil sender:nil completionBlock:nil];
+                return;
+            }
+        }
+    }
+
+    // Fallback to URL scheme
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] Using URL scheme fallback");
+    #endif
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"youtube://watch?v=%@", nextId]];
+    Class UIUtils = objc_getClass("YTUIUtils");
+    if (UIUtils && [UIUtils canOpenURL:url]) {
+        [UIUtils openURL:url];
+    }
+}
+
+// Forced navigation version - always uses navigation command, never native autonav
+// Used for scrub-to-end and doubletap-to-end where native autonav won't work
+static void ytlp_playNextFromQueueForced(void) {
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] === playNextFromQueueForced called ===");
+    #endif
+
+    // Set advance in progress flag
+    ytlp_advanceInProgress = YES;
+    ytlp_setState(YTLPStateTransitioning, @"playNextFromQueueForced");
+
+    NSDictionary *nextItem = [[YTLPLocalQueueManager shared] popNextItem];
+    NSString *nextId = nextItem[@"videoId"];
+    NSString *nextTitle = nextItem[@"title"];
+
+    if (nextId.length == 0) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] Queue is now empty");
+        #endif
+        ytlp_updateAutoplayState();
+        ytlp_resetState(@"queue empty");
+
+        Class HUD = objc_getClass("GOOHUDManagerInternal");
+        Class HUDMsg = objc_getClass("YTHUDMessage");
+        if (HUD && HUDMsg) {
+            [[HUD sharedInstance] showMessageMainThread:[HUDMsg messageWithText:@"✓ Queue complete"]];
+        }
+        return;
+    }
+
+    // Update tracking variables
+    ytlp_lastQueueAdvanceTime = [[NSDate date] timeIntervalSince1970];
+    ytlp_lastPlayedVideoId = nextId;
+    ytlp_currentPlayingVideoId = nextId;
+
+    [[YTLPLocalQueueManager shared] setCurrentlyPlayingVideoId:nextId title:nextTitle];
+
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] Forced navigation to: %@", nextId);
+    #endif
+
+    // Show toast
     Class HUD = objc_getClass("GOOHUDManagerInternal");
     Class HUDMsg = objc_getClass("YTHUDMessage");
     if (HUD && HUDMsg) {
         NSInteger remaining = [[YTLPLocalQueueManager shared] allItems].count;
         NSString *displayName = (nextTitle.length > 0) ? nextTitle : nextId;
         if (displayName.length > 40) displayName = [[displayName substringToIndex:37] stringByAppendingString:@"..."];
-        NSString *message = (remaining > 0) 
+        NSString *message = (remaining > 0)
             ? [NSString stringWithFormat:@"▶ %@ (%ld more)", displayName, (long)remaining]
             : [NSString stringWithFormat:@"▶ %@ (last)", displayName];
         [[HUD sharedInstance] showMessageMainThread:[HUDMsg messageWithText:message]];
     }
-    
-    // Update autoplay state for the new video (in case queue becomes empty after this)
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ytlp_updateAutoplayState();
-    });
-    
-    // Restart monitoring for the new video (small delay for video to start loading)
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ytlp_startEndMonitoring();
-    });
-    
+
+    // Navigate using YouTube's command system (always - no background autonav)
     Class YTICommandClass = objc_getClass("YTICommand");
     if (YTICommandClass && [YTICommandClass respondsToSelector:@selector(watchNavigationEndpointWithVideoID:)]) {
         id cmd = [YTICommandClass watchNavigationEndpointWithVideoID:nextId];
@@ -313,13 +581,19 @@ static void ytlp_playNextFromQueue(void) {
             id handler = [[Handler alloc] init];
             if ([handler respondsToSelector:@selector(sendOriginalCommandWithNavigationEndpoint:fromView:entry:sender:completionBlock:)]) {
                 [handler sendOriginalCommandWithNavigationEndpoint:cmd fromView:nil entry:nil sender:nil completionBlock:nil];
+                ytlp_advanceInProgress = NO;
                 return;
             }
         }
     }
+
+    // Fallback to URL scheme
     NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"youtube://watch?v=%@", nextId]];
     Class UIUtils = objc_getClass("YTUIUtils");
-    if (UIUtils && [UIUtils canOpenURL:url]) { [UIUtils openURL:url]; }
+    if (UIUtils && [UIUtils canOpenURL:url]) {
+        [UIUtils openURL:url];
+    }
+    ytlp_advanceInProgress = NO;
 }
 
 // Helper function to check if a string looks like a YouTube video ID
@@ -547,7 +821,7 @@ static void ytlp_collectAllVideoIds(id obj, int depth, NSMutableSet *collected, 
         // 1) Direct selectors
         if ([obj respondsToSelector:@selector(videoId)]) {
             @try {
-                id s = [obj videoId];
+                id s = [obj videoID];
                 if ([s isKindOfClass:[NSString class]] && [s length] == 11 && ytlp_looksLikeVideoId(s)) {
                     [collected addObject:s];
                 }
@@ -655,7 +929,7 @@ static NSString *ytlp_getCurrentVideoId(void) {
             if (active && [active respondsToSelector:@selector(singleVideo)]) {
                 id sv = [active singleVideo];
                 if (sv && [sv respondsToSelector:@selector(videoId)]) {
-                    NSString *vid = [sv videoId];
+                    NSString *vid = [sv videoID];
                     if ([vid isKindOfClass:[NSString class]] && vid.length > 0) return vid;
                 }
             }
@@ -773,7 +1047,7 @@ static void ytlp_extractVideoInfo(id entry, NSString **outVideoId, NSString **ou
         if (entry) {
             // Try multiple ways to get videoId from entry
             if ([entry respondsToSelector:@selector(videoId)]) {
-                videoId = [entry videoId];
+                videoId = [entry videoID];
             } else {
                 videoId = [entry valueForKey:@"videoId"];
             }
@@ -977,40 +1251,40 @@ static PlayerViewDidAppearIMP origPlayerViewDidAppear = NULL;
 typedef void (*PlayerSeekToTimeIMP)(id, SEL, CGFloat);
 static PlayerSeekToTimeIMP origPlayerSeekToTime = NULL;
 
+// Forward declaration for forced navigation (skips background autonav)
+static void ytlp_playNextFromQueueForced(void);
+
 static void ytlp_playerSeekToTime(id self, SEL _cmd, CGFloat time) {
     if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-        CGFloat currentPos = 0;
         CGFloat totalTime = 0;
-        
-        if ([self respondsToSelector:@selector(currentVideoMediaTime)]) {
-            currentPos = [(id)self currentVideoMediaTime];
-        }
+
         if ([self respondsToSelector:@selector(currentVideoTotalMediaTime)]) {
             totalTime = [(id)self currentVideoTotalMediaTime];
         }
-        
+
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
         BOOL cooldownOk = (now - ytlp_lastQueueAdvanceTime >= 3.0);
-        
+
         if (totalTime > 10.0 && cooldownOk) {
             // Case 1: Seeking TO the end (user scrubbed to end) - advance before loop
-            if (time >= (totalTime - 2.0)) {
-                ytlp_playNextFromQueue();
+            // Use forced navigation since native autonav won't work mid-video
+            if (time >= (totalTime - 1.0)) {
+                ytlp_playNextFromQueueForced();
                 return;
             }
-            
-            // Case 2: Seeking to start while at significant position (loop detection)
-            BOOL seekingToStart = (time < 3.0);
-            BOOL wasNearEnd = (currentPos >= (totalTime - 5.0));
-            BOOL wasPastMiddle = (currentPos > (totalTime * 0.5));
-            
-            if (seekingToStart && (wasNearEnd || wasPastMiddle)) {
-                ytlp_playNextFromQueue();
+
+            // Case 2: Seeking TO the start (Loop Event)
+            // If we are seeking to ~0, and we were previously deep in the video,
+            // AND we didn't just start playing (safety)
+            if (time < 1.0 && ytlp_lastTimeChangePosition > (totalTime - 5.0)) {
+                // This is likely a loop!
+                // Intercept and play next.
+                ytlp_playNextFromQueueForced();
                 return;
             }
         }
     }
-    
+
     // Execute normal seek
     if (origPlayerSeekToTime) origPlayerSeekToTime(self, _cmd, time);
 }
@@ -1026,81 +1300,189 @@ static void ytlp_playerScrubToTime(id self, SEL _cmd, CGFloat time) {
         if ([self respondsToSelector:@selector(currentVideoTotalMediaTime)]) {
             totalTime = [(id)self currentVideoTotalMediaTime];
         }
-        
-        // If scrubbing to very near the end (within 2 seconds), advance queue instead
-        if (totalTime > 10.0 && time >= (totalTime - 2.0)) {
+
+        // If scrubbing to very near the end (within 1 second), advance queue instead
+        // Use forced navigation since native autonav won't work mid-video
+        if (totalTime > 10.0 && time >= (totalTime - 1.0)) {
             NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
             if (now - ytlp_lastQueueAdvanceTime >= 3.0) {
-                ytlp_playNextFromQueue();
+                ytlp_playNextFromQueueForced();
                 return; // Don't scrub to end
             }
         }
     }
-    
+
     if (origPlayerScrubToTime) origPlayerScrubToTime(self, _cmd, time);
 }
 
-// Hook singleVideo:currentVideoTimeDidChange: to detect loops (inspired by iSponsorBlock)
-// This gets called every time the video position changes, much more reliable than a timer
+// Hook seekToTime:seekSource: (another common variant)
+typedef void (*PlayerSeekToTimeSourceIMP)(id, SEL, CGFloat, int);
+static PlayerSeekToTimeSourceIMP origPlayerSeekToTimeSource = NULL;
+
+static void ytlp_playerSeekToTimeSource(id self, SEL _cmd, CGFloat time, int source) {
+    if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
+        CGFloat totalTime = 0;
+        if ([self respondsToSelector:@selector(currentVideoTotalMediaTime)]) {
+            totalTime = [(id)self currentVideoTotalMediaTime];
+        }
+
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        BOOL cooldownOk = (now - ytlp_lastQueueAdvanceTime >= 3.0);
+
+        if (totalTime > 10.0 && cooldownOk) {
+            // Seeking TO the end - advance queue
+            if (time >= (totalTime - 1.0)) {
+                #if DEBUG
+                NSLog(@"[YTLocalQueue] seekToTime:seekSource: detected seek to end");
+                #endif
+                ytlp_playNextFromQueueForced();
+                return;
+            }
+            // Loop detection
+            if (time < 1.0 && ytlp_lastTimeChangePosition > (totalTime - 5.0)) {
+                #if DEBUG
+                NSLog(@"[YTLocalQueue] seekToTime:seekSource: detected loop");
+                #endif
+                ytlp_playNextFromQueueForced();
+                return;
+            }
+        }
+    }
+    if (origPlayerSeekToTimeSource) origPlayerSeekToTimeSource(self, _cmd, time, source);
+}
+
+// Hook seekToTime:toleranceBefore:toleranceAfter:seekSource: (most detailed variant)
+typedef void (*PlayerSeekToTimeToleranceSourceIMP)(id, SEL, CGFloat, CGFloat, CGFloat, int);
+static PlayerSeekToTimeToleranceSourceIMP origPlayerSeekToTimeToleranceSource = NULL;
+
+static void ytlp_playerSeekToTimeToleranceSource(id self, SEL _cmd, CGFloat time, CGFloat before, CGFloat after, int source) {
+    if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
+        CGFloat totalTime = 0;
+        if ([self respondsToSelector:@selector(currentVideoTotalMediaTime)]) {
+            totalTime = [(id)self currentVideoTotalMediaTime];
+        }
+
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        BOOL cooldownOk = (now - ytlp_lastQueueAdvanceTime >= 3.0);
+
+        if (totalTime > 10.0 && cooldownOk) {
+            if (time >= (totalTime - 1.0)) {
+                #if DEBUG
+                NSLog(@"[YTLocalQueue] seekToTime:toleranceBefore:toleranceAfter:seekSource: detected seek to end");
+                #endif
+                ytlp_playNextFromQueueForced();
+                return;
+            }
+            if (time < 1.0 && ytlp_lastTimeChangePosition > (totalTime - 5.0)) {
+                #if DEBUG
+                NSLog(@"[YTLocalQueue] seekToTime:toleranceBefore:toleranceAfter:seekSource: detected loop");
+                #endif
+                ytlp_playNextFromQueueForced();
+                return;
+            }
+        }
+    }
+    if (origPlayerSeekToTimeToleranceSource) origPlayerSeekToTimeToleranceSource(self, _cmd, time, before, after, source);
+}
+
+// ============================================================================
+// TIME CHANGE MONITORING (Backup/Safety Net Layer)
+// ============================================================================
+
+// Hook singleVideo:currentVideoTimeDidChange: for time-based monitoring
+// This is a BACKUP mechanism - primary detection should be through video end hooks
 typedef void (*SingleVideoTimeDidChangeIMP)(id, SEL, id, YTSingleVideoTime *);
 static SingleVideoTimeDidChangeIMP origSingleVideoTimeDidChange = NULL;
 static SingleVideoTimeDidChangeIMP origPotentiallyMutatedSingleVideoTimeDidChange = NULL;
 
 static void ytlp_handleVideoTimeChange(id self, YTSingleVideoTime *videoTime) {
     if (!YTLP_AutoAdvanceEnabled() || [[YTLPLocalQueueManager shared] isEmpty]) {
+        // Reset state if auto-advance is disabled or queue is empty
+        if (ytlp_advanceState != YTLPStateIdle) {
+            ytlp_resetState(@"auto-advance disabled or queue empty");
+        }
         return;
     }
-    
+
+    // Use the time object directly - it works in background/PiP
     CGFloat currentTime = videoTime.time;
     CGFloat totalTime = 0;
-    
+
+    // Try to get total time from the view controller
     if ([self respondsToSelector:@selector(currentVideoTotalMediaTime)]) {
         totalTime = [(id)self currentVideoTotalMediaTime];
     }
-    
-    // Skip if we don't have valid times
-    if (totalTime < 10.0) {
-        ytlp_lastTimeChangePosition = currentTime;
-        ytlp_lastTimeChangeTotal = totalTime;
-        return;
+
+    // Safety check - ignore short/invalid videos
+    if (totalTime < 5.0) return;
+
+    // Update state based on playback position
+    if (currentTime < 2.0 && ytlp_advanceState != YTLPStateIdle && ytlp_advanceState != YTLPStateTransitioning) {
+        // Video just started or restarted - clear the consumed video ID
+        ytlp_currentPlayingVideoId = nil;
+        ytlp_resetState(@"video (re)started");
+    } else if (currentTime >= (totalTime - 5.0)) {
+        // Near end of video
+        if (ytlp_advanceState == YTLPStatePlaying || ytlp_advanceState == YTLPStateIdle) {
+            ytlp_setState(YTLPStateNearEnd, @"approaching end");
+        }
+    } else if (currentTime > 5.0 && currentTime < (totalTime - 5.0)) {
+        // Middle of video - normal playback
+        if (ytlp_advanceState != YTLPStatePlaying &&
+            ytlp_advanceState != YTLPStateUserPaused &&
+            ytlp_advanceState != YTLPStateTransitioning &&
+            ytlp_advanceState != YTLPStateWaitingForLoad) {
+            ytlp_setState(YTLPStatePlaying, @"normal playback");
+        }
     }
-    
-    // Track if playback started (position ever exceeded 1 second)
-    if (currentTime > 1.0) {
-        ytlp_playbackStarted = YES;
+
+    // End detection (BACKUP - primary should be videoDidFinish hooks)
+    // Trigger at 0.3s remaining to catch edge cases
+    if (currentTime >= (totalTime - 0.3) && ytlp_advanceState != YTLPStateEnded) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] Time-based end detection: %.1f/%.1f", currentTime, totalTime);
+        #endif
+        ytlp_endDetected = YES;
+        ytlp_setState(YTLPStateEnded, @"time reached end");
+
+        if (ytlp_shouldAllowQueueAdvance(@"time-based end detection")) {
+            ytlp_playNextFromQueue();
+        }
     }
-    
-    // Reset if video changed
-    if (fabs(totalTime - ytlp_lastTimeChangeTotal) > 5.0) {
-        ytlp_playbackStarted = (currentTime > 1.0);
+
+    // BACKUP: Loop detection (RARE - only if user manually enabled loop or endscreen hooks failed)
+    // If we jumped from late in video (> 80% or > 20s) back to start (< 2s), it's likely a loop
+    // This is now a LOW PRIORITY backup since we intercept earlier with endscreen hooks
+    if (ytlp_lastTimeChangePosition > MAX(totalTime * 0.8, 20.0) && currentTime < 2.0) {
+        // Possible loop detected
+        NSTimeInterval timeSinceLastAdvance = [[NSDate date] timeIntervalSince1970] - ytlp_lastQueueAdvanceTime;
+
+        // Only treat as loop if:
+        // 1. We're not already transitioning
+        // 2. Video played for significant time (20+ seconds to avoid false positives)
+        // 3. This isn't a new video starting
+        // 4. IMPORTANTLY: Enough time passed (10s) so we don't trigger on first loop
+        //    (Give endscreen/autonav hooks a chance to work first)
+        if (ytlp_advanceState != YTLPStateTransitioning &&
+            ytlp_advanceState != YTLPStateWaitingForLoad &&
+            ytlp_advanceState != YTLPStateEnded && // Don't re-trigger if already marked ended
+            timeSinceLastAdvance > 10.0) { // Increased from 5.0 to 10.0 - less aggressive
+
+            #if DEBUG
+            NSLog(@"[YTLocalQueue] ⚠️ Loop detected (backup): %.1f -> %.1f (this shouldn't happen often)", ytlp_lastTimeChangePosition, currentTime);
+            #endif
+
+            ytlp_endDetected = YES;
+            ytlp_setState(YTLPStateEnded, @"loop detected (backup)");
+
+            if (ytlp_shouldAllowQueueAdvance(@"loop interception (backup)")) {
+                ytlp_playNextFromQueue();
+            }
+        }
     }
-    
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    BOOL cooldownOk = (now - ytlp_lastQueueAdvanceTime >= 3.0);
-    
-    // SIMPLE LOOP DETECTION: If playback started and now at position ~0, it's a loop
-    BOOL nowAtStart = (currentTime < 1.0);
-    
-    if (nowAtStart && ytlp_playbackStarted && cooldownOk) {
-        // This is a loop - advance queue
-        ytlp_lastTimeChangePosition = 0;
-        ytlp_lastTimeChangeTotal = 0;
-        ytlp_playbackStarted = NO;
-        ytlp_playNextFromQueue();
-        return;
-    }
-    
-    // Update tracking
+
+    // Update last position
     ytlp_lastTimeChangePosition = currentTime;
-    ytlp_lastTimeChangeTotal = totalTime;
-    
-    // Proactive advance: if we're very close to the end, advance before loop
-    if (currentTime >= (totalTime - 1.0) && totalTime > 10.0 && cooldownOk) {
-        ytlp_lastTimeChangePosition = 0;
-        ytlp_lastTimeChangeTotal = 0;
-        ytlp_playbackStarted = NO;
-        ytlp_playNextFromQueue();
-    }
 }
 
 static void ytlp_singleVideoTimeDidChange(id self, SEL _cmd, id singleVideo, YTSingleVideoTime *videoTime) {
@@ -1121,8 +1503,10 @@ static void ytlp_playerViewDidAppear(id self, SEL _cmd, BOOL animated) {
     [[YTLPLocalQueueManager shared] setCurrentPlayerViewController:self];
     
     // Start monitoring immediately when player appears
-    ytlp_playbackStarted = NO;  // Reset for new video
-    ytlp_startEndMonitoring();
+    // ytlp_startEndMonitoring();
+    
+    // Re-register remote commands to ensure we have control of the lock screen
+    ytlp_setupRemoteCommands();
     
     // Update currently playing video for the Local Queue view
     // Try immediately and also after a short delay (video may not be loaded yet)
@@ -1392,7 +1776,6 @@ static NSMutableArray* ytlp_menuActionsForRenderers(id self, SEL _cmd, NSMutable
                 if (resolvedVideoId.length > 0) {
                     // Add to queue immediately
                     [[YTLPLocalQueueManager shared] addVideoId:resolvedVideoId title:resolvedTitle];
-                    ytlp_updateAutoplayState();
                     
                     Class HUD = objc_getClass("GOOHUDManagerInternal");
                     Class HUDMsg = objc_getClass("YTHUDMessage");
@@ -1460,6 +1843,9 @@ static AppDelegateDidBecomeActiveIMP origAppDelegateDidBecomeActive = NULL;
 
 static void ytlp_appDelegateDidBecomeActive(id self, SEL _cmd, UIApplication *application) {
     if (origAppDelegateDidBecomeActive) origAppDelegateDidBecomeActive(self, _cmd, application);
+    
+    // Refresh remote commands when app comes to foreground
+    ytlp_setupRemoteCommands();
 }
 
 // YTSingleVideoController hooks
@@ -1480,7 +1866,7 @@ static void ytlp_singleVideoPlayerRateDidChange(id self, SEL _cmd, float rate) {
                 id singleVideo = [self singleVideo];
                 if (singleVideo) {
                     if ([singleVideo respondsToSelector:@selector(videoId)]) {
-                        videoId = [singleVideo videoId];
+                        videoId = [singleVideo videoID];
                     }
                     if ([singleVideo respondsToSelector:@selector(title)]) {
                         id titleObj = [singleVideo title];
@@ -1497,7 +1883,7 @@ static void ytlp_singleVideoPlayerRateDidChange(id self, SEL _cmd, float rate) {
             if (videoId.length == 0 && [self respondsToSelector:@selector(videoData)]) {
                 id videoData = [self videoData];
                 if (videoData && [videoData respondsToSelector:@selector(videoId)]) {
-                    videoId = [videoData videoId];
+                    videoId = [videoData videoID];
                 }
             }
         } @catch (__unused NSException *e) {}
@@ -1521,29 +1907,7 @@ static void ytlp_singleVideoPlayerRateDidChange(id self, SEL _cmd, float rate) {
     
     // Since we've disabled YouTube's autoplay, we need to be more proactive about detecting video ends
     if (rate == 0.0f && ytlp_currentPlayerVC) {
-        // Check immediately if we're at the end
-        CGFloat total = [ytlp_currentPlayerVC currentVideoTotalMediaTime];
-        CGFloat current = [ytlp_currentPlayerVC currentVideoMediaTime];
-        
-        // Since we're forcing loop mode, we need to be more aggressive about detecting video end
-        if (total > 0 && current >= (total - 3.0)) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-                    if (ytlp_shouldAllowQueueAdvance(@"video stopped near end (loop mode)")) {
-                        ytlp_playNextFromQueue();
-                    }
-                }
-            });
-        } else {
-            // For mid-video pauses, wait longer and be more strict
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-                    if (ytlp_shouldAllowQueueAdvance(@"video paused (loop mode active)")) {
-                        ytlp_playNextFromQueue();
-                    }
-                }
-            });
-        }
+        // No longer needed
     }
 }
 
@@ -1554,21 +1918,20 @@ static AutoplayGetNextVideoIMP origAutoplayGetNextVideo = NULL;
 static id ytlp_autoplayGetNextVideo(id self, SEL _cmd) {
     // If auto-advance is enabled and we have items in queue, override
     if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-        NSDictionary *nextItem = [[YTLPLocalQueueManager shared] popNextItem];
-        NSString *nextId = nextItem[@"videoId"];
-        NSString *nextTitle = nextItem[@"title"];
-        if (nextId.length > 0) {
-            // Update tracking variables to prevent double-triggers
-            ytlp_lastQueueAdvanceTime = [[NSDate date] timeIntervalSince1970];
-            ytlp_lastPlayedVideoId = nextId;
+        // Use peek to get ID, then construct command.
+        NSArray *items = [[YTLPLocalQueueManager shared] allItems];
+        if (items.count > 0) {
+            NSDictionary *nextItem = items[0];
+            NSString *nextId = nextItem[@"videoId"];
             
-            // Update currently playing for the Local Queue view
-            [[YTLPLocalQueueManager shared] setCurrentlyPlayingVideoId:nextId title:nextTitle];
-            
-            // Create a video object for our queue item
-            Class YTICommandClass = objc_getClass("YTICommand");
-            if (YTICommandClass && [YTICommandClass respondsToSelector:@selector(watchNavigationEndpointWithVideoID:)]) {
-                return [YTICommandClass watchNavigationEndpointWithVideoID:nextId];
+            if (nextId.length > 0) {
+                // Create a video object for our queue item
+                Class YTICommandClass = objc_getClass("YTICommand");
+                if (YTICommandClass && [YTICommandClass respondsToSelector:@selector(watchNavigationEndpointWithVideoID:)]) {
+                    id cmd = [YTICommandClass watchNavigationEndpointWithVideoID:nextId];
+                    // IMPORTANT: Return this command to force YouTube to play OUR video next
+                    return cmd;
+                }
             }
         }
     }
@@ -1600,230 +1963,332 @@ typedef void (*VideoDidFinishIMP)(id, SEL);
 static VideoDidFinishIMP origVideoDidFinish = NULL;
 
 static void ytlp_videoDidFinish(id self, SEL _cmd) {
-    if (origVideoDidFinish) origVideoDidFinish(self, _cmd);
-    
     // Try to play next from queue if enabled, with safety check
     if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (ytlp_shouldAllowQueueAdvance(@"video finished")) {
-                ytlp_playNextFromQueue();
-            }
-        });
+        // PREEMPTIVE: Play next immediately and SKIP original
+        if (ytlp_shouldAllowQueueAdvance(@"video finished (preemptive)")) {
+             ytlp_playNextFromQueue();
+             return;
+        }
+    }
+    
+    if (origVideoDidFinish) origVideoDidFinish(self, _cmd);
+}
+
+// Hook MPRemoteCommandCenter to handle next track command
+// typedef void (*AddTargetActionIMP)(id, SEL, id, SEL);
+// static AddTargetActionIMP origAddTargetAction = NULL;
+
+// typedef id (*AddTargetWithHandlerIMP)(id, SEL, id);
+// static AddTargetWithHandlerIMP origAddTargetWithHandler = NULL;
+
+// Unused hooks removed
+/*
+static void ytlp_handleNextTrack(id event) {
+    if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
+         ytlp_playNextFromQueue();
     }
 }
 
-// Hook YTAutoplayAutonavController - completely override autoplay like YouLoop does
+static void ytlp_addTargetAction(id self, SEL _cmd, id target, SEL action) {
+    if (origAddTargetAction) origAddTargetAction(self, _cmd, target, action);
+}
+
+static id ytlp_addTargetWithHandler(id self, SEL _cmd, id (^handler)(id)) {
+    return origAddTargetWithHandler ? origAddTargetWithHandler(self, _cmd, handler) : nil;
+}
+*/
+
+// Hook MPRemoteCommandCenter sharedCommandCenter to register our handler
+static id ytlp_remoteCommandTarget = nil;
+
+static void ytlp_setupRemoteCommands(void) {
+    // Only proceed if main thread (safety)
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ytlp_setupRemoteCommands();
+        });
+        return;
+    }
+
+    MPRemoteCommandCenter *center = [MPRemoteCommandCenter sharedCommandCenter];
+    MPRemoteCommand *nextCmd = [center nextTrackCommand];
+    
+    [nextCmd setEnabled:YES];
+    
+    // Remove previous target if we have one to avoid duplicates
+    if (ytlp_remoteCommandTarget) {
+        [nextCmd removeTarget:ytlp_remoteCommandTarget];
+        ytlp_remoteCommandTarget = nil;
+    }
+    
+    // Add new target
+    ytlp_remoteCommandTarget = [nextCmd addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent * _Nonnull event) {
+        if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
+            #if DEBUG
+            NSLog(@"[YTLocalQueue] Remote next track command (lock screen/control center)");
+            #endif
+
+            // For background playback, use direct player transition to avoid waking screen
+            if (ytlp_isAppInBackground()) {
+                if (ytlp_playNextInBackground()) {
+                    return MPRemoteCommandHandlerStatusSuccess;
+                }
+                // If background method failed, fall through to regular method
+            }
+
+            // Fallback: use regular playNextFromQueue (may wake screen but always works)
+            ytlp_userInitiated = YES;
+            ytlp_endDetected = YES;
+            ytlp_playNextFromQueue();
+            return MPRemoteCommandHandlerStatusSuccess;
+        }
+        return MPRemoteCommandHandlerStatusCommandFailed;
+    }];
+}
+
+// ============================================================================
+// YOUTUBE AUTONAV/AUTOPLAY INTERCEPTION (Primary Layer)
+// ============================================================================
+
+// CRITICAL STRATEGY CHANGE:
+// Instead of forcing loop mode (which causes the loop problem), we intercept
+// YouTube's autoplay/autonav system to inject our own next video.
+
 typedef NSInteger (*AutonavLoopModeIMP)(id, SEL);
 static AutonavLoopModeIMP origAutonavLoopMode = NULL;
 
-static NSInteger ytlp_autonavLoopMode(id self, SEL _cmd) {
-    // If we have items in local queue and auto-advance is enabled, force loop mode like YouLoop does
-    if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-        return 2; // Set to 2 (loop mode) to prevent ANY other video from playing - we'll handle advancement manually
-    }
-    return origAutonavLoopMode ? origAutonavLoopMode(self, _cmd) : 0;
-}
+typedef void (*AutonavPlayNextIMP)(id, SEL);
+static AutonavPlayNextIMP origAutonavPlayNext = NULL;
 
-// Hook setLoopMode to completely override YouTube's autoplay decisions (like YouLoop)
-typedef void (*AutonavSetLoopModeIMP)(id, SEL, NSInteger);
-static AutonavSetLoopModeIMP origAutonavSetLoopMode = NULL;
+typedef void (*AutonavPlayAutonavIMP)(id, SEL);
+static AutonavPlayAutonavIMP origAutonavPlayAutonav = NULL;
 
-static void ytlp_autonavSetLoopMode(id self, SEL _cmd, NSInteger loopMode) {
-    // If we have local queue items and auto-advance is enabled, completely override YouTube's decision (like YouLoop)
-    if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-        // Force loop mode to 2 like YouLoop does - this prevents ANY other video from playing
-        if (origAutonavSetLoopMode) origAutonavSetLoopMode(self, _cmd, 2);
-        return;
-    }
-    
-    // Fall back to original setLoopMode with original parameter
-    if (origAutonavSetLoopMode) origAutonavSetLoopMode(self, _cmd, loopMode);
-}
+typedef void (*AutonavPlayAutoplayIMP)(id, SEL);
+static AutonavPlayAutoplayIMP origAutonavPlayAutoplay = NULL;
 
-// Hook methods that might be called when video tries to loop - intercept and play from queue instead
-typedef void (*AutonavPerformNavigationIMP)(id, SEL);
-static AutonavPerformNavigationIMP origAutonavPerformNavigation = NULL;
+typedef id (*AutonavEndpointIMP)(id, SEL);
+static AutonavEndpointIMP origAutonavEndpoint = NULL;
 
-static void ytlp_autonavPerformNavigation(id self, SEL _cmd) {
-    // If we have queue items and this is about to loop, play from queue instead
-    if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-        // Use simpler check - the loop itself proves video ended
-        if (ytlp_shouldAllowLoopIntercept()) {
-            ytlp_playNextFromQueue();
-            return;
-        }
-    }
-    
-    // Fall back to original navigation (loop)
-    if (origAutonavPerformNavigation) origAutonavPerformNavigation(self, _cmd);
-}
-
-// Hook navigation execution to intercept loop attempts
-typedef void (*AutonavExecuteNavigationIMP)(id, SEL);
-static AutonavExecuteNavigationIMP origAutonavExecuteNavigation = NULL;
-
-static void ytlp_autonavExecuteNavigation(id self, SEL _cmd) {
-    // If we have queue items and this would execute loop navigation, play from queue instead
-    if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-        // Use simpler check - the loop itself proves video ended
-        if (ytlp_shouldAllowLoopIntercept()) {
-            ytlp_playNextFromQueue();
-            return;
-        }
-    }
-    
-    // Fall back to original execution (loop)
-    if (origAutonavExecuteNavigation) origAutonavExecuteNavigation(self, _cmd);
-}
-
-// Hook YTCoWatchWatchEndpointWrapperCommandHandler to intercept next button navigation
-typedef void (*SendOriginalCommandIMP)(id, SEL, id, id, id, id, id);
-static SendOriginalCommandIMP origSendOriginalCommand = NULL;
-
-static void ytlp_sendOriginalCommand(id self, SEL _cmd, id navigationEndpoint, id fromView, id entry, id sender, id completionBlock) {
-    // Just pass through - this hook was too aggressive
-    if (origSendOriginalCommand) {
-        origSendOriginalCommand(self, _cmd, navigationEndpoint, fromView, entry, sender, completionBlock);
-    }
-}
-
-// Hook YTCommandResponderEvent to intercept command dispatch (more fundamental interception)
-typedef void (*ResponderEventSendIMP)(id, SEL);
-static ResponderEventSendIMP origResponderEventSend = NULL;
-
-static void ytlp_responderEventSend(id self, SEL _cmd) {
-    // Just pass through - this hook was too aggressive
-    if (origResponderEventSend) {
-        origResponderEventSend(self, _cmd);
-    }
-}
-
-// Hook init to disable autoplay from the start when we have queue items
 typedef id (*AutonavInitIMP)(id, SEL, id);
 static AutonavInitIMP origAutonavInit = NULL;
 
+// Note: AutoplayGetNextVideoIMP already defined earlier in the file
+
+// DON'T force loop mode - let YouTube handle natural playback
+static NSInteger ytlp_autonavLoopMode(id self, SEL _cmd) {
+    // Return original loop mode - don't interfere
+    return origAutonavLoopMode ? origAutonavLoopMode(self, _cmd) : 0;
+}
+
+// Helper to consume queue item and let YouTube's autonav handle the actual playback
+// This avoids waking the screen by using YouTube's native background transition
+static BOOL ytlp_consumeQueueForAutonav(void) {
+    if (!YTLP_AutoAdvanceEnabled() || [[YTLPLocalQueueManager shared] isEmpty]) {
+        return NO;
+    }
+
+    // Pop the next item from queue - autonavEndpoint will provide the video ID
+    NSDictionary *nextItem = [[YTLPLocalQueueManager shared] popNextItem];
+    NSString *nextId = nextItem[@"videoId"];
+    NSString *nextTitle = nextItem[@"title"];
+
+    if (nextId.length == 0) {
+        return NO;
+    }
+
+    // Update tracking
+    ytlp_lastQueueAdvanceTime = [[NSDate date] timeIntervalSince1970];
+    ytlp_lastPlayedVideoId = nextId;
+    ytlp_currentPlayingVideoId = nextId;
+    [[YTLPLocalQueueManager shared] setCurrentlyPlayingVideoId:nextId title:nextTitle];
+
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] Consumed queue item for autonav: %@", nextId);
+    #endif
+
+    return YES;
+}
+
+// Intercept playNext to inject queue video
+static void ytlp_autonavPlayNext(id self, SEL _cmd) {
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] YTAutoplayAutonavController.playNext called");
+    #endif
+
+    // Consume queue item - autonavEndpoint will provide the video
+    ytlp_consumeQueueForAutonav();
+
+    // Always call original - let YouTube handle the actual transition
+    // This keeps the screen off during background playback
+    if (origAutonavPlayNext) origAutonavPlayNext(self, _cmd);
+}
+
+// Intercept playAutonav (auto-advance to next video)
+static void ytlp_autonavPlayAutonav(id self, SEL _cmd) {
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] YTAutoplayAutonavController.playAutonav called");
+    #endif
+
+    // Consume queue item - autonavEndpoint will provide the video
+    ytlp_consumeQueueForAutonav();
+
+    // Always call original - let YouTube handle the actual transition
+    if (origAutonavPlayAutonav) origAutonavPlayAutonav(self, _cmd);
+}
+
+// Intercept playAutoplay
+static void ytlp_autonavPlayAutoplay(id self, SEL _cmd) {
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] YTAutoplayAutonavController.playAutoplay called");
+    #endif
+
+    // Consume queue item - autonavEndpoint will provide the video
+    ytlp_consumeQueueForAutonav();
+
+    // Always call original - let YouTube handle the actual transition
+    if (origAutonavPlayAutoplay) origAutonavPlayAutoplay(self, _cmd);
+}
+
+// Helper to create queue endpoint
+static id ytlp_createQueueEndpoint(NSString *videoId) {
+    if (videoId.length == 0) return nil;
+
+    Class YTICommandClass = objc_getClass("YTICommand");
+    if (YTICommandClass && [YTICommandClass respondsToSelector:@selector(watchNavigationEndpointWithVideoID:)]) {
+        return [YTICommandClass watchNavigationEndpointWithVideoID:videoId];
+    }
+    return nil;
+}
+
+// Get the video ID to use for endpoint hooks
+static NSString *ytlp_getNextQueueVideoId(void) {
+    if (!YTLP_AutoAdvanceEnabled()) return nil;
+
+    // First priority: consumed video ID
+    if (ytlp_currentPlayingVideoId.length > 0) {
+        return ytlp_currentPlayingVideoId;
+    }
+
+    // Second priority: peek at queue
+    if (![[YTLPLocalQueueManager shared] isEmpty]) {
+        NSDictionary *nextItem = [[YTLPLocalQueueManager shared] peekNextItem];
+        return nextItem[@"videoId"];
+    }
+
+    return nil;
+}
+
+// Intercept autonavEndpoint to return our queue endpoint
+static id ytlp_autonavEndpoint(id self, SEL _cmd) {
+    NSString *videoId = ytlp_getNextQueueVideoId();
+    if (videoId) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] autonavEndpoint returning: %@", videoId);
+        #endif
+        id endpoint = ytlp_createQueueEndpoint(videoId);
+        if (endpoint) return endpoint;
+    }
+    return origAutonavEndpoint ? origAutonavEndpoint(self, _cmd) : nil;
+}
+
+// Intercept nextEndpointForAutonav - this is what YouTube uses to get the next video
+typedef id (*NextEndpointForAutonavIMP)(id, SEL);
+static NextEndpointForAutonavIMP origNextEndpointForAutonav = NULL;
+
+static id ytlp_nextEndpointForAutonav(id self, SEL _cmd) {
+    NSString *videoId = ytlp_getNextQueueVideoId();
+    if (videoId) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] nextEndpointForAutonav returning: %@", videoId);
+        #endif
+        id endpoint = ytlp_createQueueEndpoint(videoId);
+        if (endpoint) return endpoint;
+    }
+    return origNextEndpointForAutonav ? origNextEndpointForAutonav(self, _cmd) : nil;
+}
+
+// Intercept autoplayEndpoint
+typedef id (*AutoplayEndpointIMP)(id, SEL);
+static AutoplayEndpointIMP origAutoplayEndpoint = NULL;
+
+static id ytlp_autoplayEndpoint(id self, SEL _cmd) {
+    NSString *videoId = ytlp_getNextQueueVideoId();
+    if (videoId) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] autoplayEndpoint returning: %@", videoId);
+        #endif
+        id endpoint = ytlp_createQueueEndpoint(videoId);
+        if (endpoint) return endpoint;
+    }
+    return origAutoplayEndpoint ? origAutoplayEndpoint(self, _cmd) : nil;
+}
+
+// Intercept nextEndpointForAutoplay
+typedef id (*NextEndpointForAutoplayIMP)(id, SEL);
+static NextEndpointForAutoplayIMP origNextEndpointForAutoplay = NULL;
+
+static id ytlp_nextEndpointForAutoplay(id self, SEL _cmd) {
+    NSString *videoId = ytlp_getNextQueueVideoId();
+    if (videoId) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] nextEndpointForAutoplay returning: %@", videoId);
+        #endif
+        id endpoint = ytlp_createQueueEndpoint(videoId);
+        if (endpoint) return endpoint;
+    }
+    return origNextEndpointForAutoplay ? origNextEndpointForAutoplay(self, _cmd) : nil;
+}
+
+// Store reference to autonav controller when initialized
 static id ytlp_autonavInit(id self, SEL _cmd, id parentResponder) {
-    self = origAutonavInit ? origAutonavInit(self, _cmd, parentResponder) : nil;
-    if (self) {
-        // If we have queue items, immediately disable autoplay like YouLoop does
-        if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-            // Force loop mode like YouLoop does to prevent any other video from playing
-            if ([self respondsToSelector:@selector(setLoopMode:)]) {
-                [(YTAutoplayAutonavController *)self setLoopMode:2];
-            }
-        }
+    id instance = origAutonavInit ? origAutonavInit(self, _cmd, parentResponder) : nil;
+    if (instance) {
+        ytlp_currentAutonavController = instance;
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] YTAutoplayAutonavController initialized");
+        #endif
     }
-    return self;
+    return instance;
 }
 
-// Function to update autoplay controller when queue state changes
+// ============================================================================
+// ENDSCREEN CONTROLLER HOOKS (Show Countdown with QUEUE Video!)
+// ============================================================================
+
+// UPDATED STRATEGY: Let countdown show, but display QUEUE video (not YouTube's choice)
+// The autonavEndpoint hook provides our queue video, so countdown shows correct video!
+
+typedef void (*EndscreenVideoDidFinishIMP)(id, SEL);
+static EndscreenVideoDidFinishIMP origEndscreenVideoDidFinish = NULL;
+
+// Track video end for state management
+static void ytlp_endscreenVideoDidFinish(id self, SEL _cmd) {
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] YTAutonavEndscreenController.videoDidFinish called");
+    #endif
+
+    // Mark that video ended
+    ytlp_endDetected = YES;
+    ytlp_setState(YTLPStateEnded, @"endscreen videoDidFinish");
+
+    // Always call original - let YouTube show endscreen/countdown
+    // The autonavEndpoint hook will provide our queue video for the countdown!
+    if (origEndscreenVideoDidFinish) origEndscreenVideoDidFinish(self, _cmd);
+}
+
 static void ytlp_updateAutoplayState(void) {
-    // Find the current autoplay controller and update its state
-    Class YTMainAppVideoPlayerOverlayViewControllerClass = objc_getClass("YTMainAppVideoPlayerOverlayViewController");
-    if (!YTMainAppVideoPlayerOverlayViewControllerClass) return;
-    
-    // Try to get the current overlay instance from the player
-    if (ytlp_currentPlayerVC && [ytlp_currentPlayerVC respondsToSelector:@selector(activeVideoPlayerOverlay)]) {
-        id overlay = [ytlp_currentPlayerVC activeVideoPlayerOverlay];
-        if (overlay && [overlay isKindOfClass:YTMainAppVideoPlayerOverlayViewControllerClass]) {
-            // Get the autoplay controller like YouLoop does
-            if ([overlay respondsToSelector:@selector(valueForKey:)]) {
-                id autonavController = [overlay valueForKey:@"_autonavController"];
-                if (autonavController && [autonavController respondsToSelector:@selector(setLoopMode:)]) {
-                    if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-                        // Force loop mode like YouLoop does when we have queue items (prevents any other video from playing)
-                        [(YTAutoplayAutonavController *)autonavController setLoopMode:2];
-                    } else {
-                        // Re-enable normal autoplay when queue is empty (mode 0 = no loop, autoplay enabled)
-                        [(YTAutoplayAutonavController *)autonavController setLoopMode:0];
-                    }
-                }
-            }
-        }
-    }
+    // This function can now be simpler - we don't need to force loop mode
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] Update autoplay state (queue has %ld items)", (long)[[YTLPLocalQueueManager shared] allItems].count);
+    #endif
+    // Nothing to do - we intercept at the navigation point instead
 }
 
-// Proactive video end monitoring - check every second if we're near end and intercept loop
-static void ytlp_checkVideoEnd(NSTimer *timer) {
-    if (!YTLP_AutoAdvanceEnabled() || [[YTLPLocalQueueManager shared] isEmpty] || !ytlp_currentPlayerVC) {
-        return;
-    }
-    
-    CGFloat total = [ytlp_currentPlayerVC currentVideoTotalMediaTime];
-    CGFloat current = [ytlp_currentPlayerVC currentVideoMediaTime];
-    
-    // Track if playback ever started (position exceeded 1 second)
-    if (current > 1.0) {
-        ytlp_playbackStarted = YES;
-    }
-    
-    // Reset playback flag if video changed (total time changed significantly)
-    if (fabs(total - ytlp_lastKnownTotal) > 5.0) {
-        ytlp_playbackStarted = (current > 1.0);
-    }
-    
-    // SIMPLE LOOP DETECTION: If playback started and now position is near 0, it's a loop
-    // This catches ALL loops including after scrubbing to end from any position
-    BOOL nowAtStart = (current < 1.0);
-    BOOL loopDetected = NO;
-    
-    if (nowAtStart && ytlp_playbackStarted && total > 10.0) {
-        loopDetected = YES;
-    }
-    
-    // Update tracking for next check
-    ytlp_lastKnownPosition = current;
-    ytlp_lastKnownTotal = total;
-    
-    // If loop detected, advance queue
-    if (loopDetected) {
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        if (now - ytlp_lastQueueAdvanceTime >= 3.0) {
-            ytlp_playbackStarted = NO;
-            ytlp_stopEndMonitoring();
-            ytlp_playNextFromQueue();
-            return;
-        }
-    }
-    
-    // If we're within 1 second of the end, immediately play from queue to prevent loop
-    if (total > 10.0 && current >= (total - 1.0)) {
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        if (now - ytlp_lastQueueAdvanceTime >= 3.0) {
-            ytlp_playbackStarted = NO;
-            ytlp_stopEndMonitoring();
-            ytlp_playNextFromQueue();
-        }
-    }
-}
-
-static void ytlp_startEndMonitoring(void) {
-    ytlp_stopEndMonitoring(); // Stop any existing timer
-    
-    // Initialize position tracking with current values (don't reset to 0)
-    // This allows loop detection to work immediately
-    if (ytlp_currentPlayerVC) {
-        ytlp_lastKnownPosition = [ytlp_currentPlayerVC currentVideoMediaTime];
-        ytlp_lastKnownTotal = [ytlp_currentPlayerVC currentVideoTotalMediaTime];
-    } else {
-        ytlp_lastKnownPosition = 0;
-        ytlp_lastKnownTotal = 0;
-    }
-    
-    if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
-        // Use a block-based timer - check every 0.1s for instant loop detection
-        ytlp_endCheckTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *timer) {
-            ytlp_checkVideoEnd(timer);
-        }];
-    }
-}
-
-static void ytlp_stopEndMonitoring(void) {
-    if (ytlp_endCheckTimer) {
-        [ytlp_endCheckTimer invalidate];
-        ytlp_endCheckTimer = nil;
-    }
-}
+// Removed legacy timer check
+static void ytlp_startEndMonitoring(void) {} // Kept as stub called by ViewDidLoad
+// static void ytlp_checkVideoEnd(NSTimer *timer) {}
+// static void ytlp_stopEndMonitoring(void) {}
 
 // YTMainAppVideoPlayerOverlayViewController hooks
 typedef void (*OverlayViewDidLoadIMP)(id, SEL);
@@ -1997,7 +2462,6 @@ static void ytlp_addToQueueTapped(id self, SEL _cmd, id sender) {
     Class HUDMsg = objc_getClass("YTHUDMessage");
     if (videoId.length > 0) {
         [[YTLPLocalQueueManager shared] addVideoId:videoId title:title];
-        ytlp_updateAutoplayState();
         
         if (title.length > 0) {
             NSString *displayName = title;
@@ -2029,9 +2493,13 @@ static void ytlp_showQueueTapped(id self, SEL _cmd, id sender) {
 }
 
 static void ytlp_nextFromQueueTapped(id self, SEL _cmd, id sender) {
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] Next button tapped");
+    #endif
+
     Class HUD = objc_getClass("GOOHUDManagerInternal");
     Class HUDMsg = objc_getClass("YTHUDMessage");
-    
+
     // Check if queue is empty
     if ([[YTLPLocalQueueManager shared] isEmpty]) {
         if (HUD && HUDMsg) {
@@ -2039,9 +2507,42 @@ static void ytlp_nextFromQueueTapped(id self, SEL _cmd, id sender) {
         }
         return;
     }
-    
+
+    // Set user-initiated flag for immediate response
+    ytlp_userInitiated = YES;
+    ytlp_endDetected = YES; // Treat as if video ended
+
     // Play next from queue
     ytlp_playNextFromQueue();
+}
+
+// ============================================================================
+// NATIVE NEXT BUTTON HOOK (YTMainAppVideoPlayerOverlayViewController)
+// ============================================================================
+
+typedef void (*OverlayDidPressNextIMP)(id, SEL, id);
+static OverlayDidPressNextIMP origOverlayDidPressNext = NULL;
+
+static void ytlp_overlayDidPressNext(id self, SEL _cmd, id sender) {
+    #if DEBUG
+    NSLog(@"[YTLocalQueue] Native next button pressed (didPressNext:)");
+    #endif
+
+    // If queue has items and auto-advance is enabled, play from queue
+    if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
+        #if DEBUG
+        NSLog(@"[YTLocalQueue] Intercepting native next - playing from queue");
+        #endif
+        ytlp_userInitiated = YES;
+        ytlp_endDetected = YES;
+        ytlp_playNextFromQueue();
+        return; // Don't call original
+    }
+
+    // Otherwise, call original
+    if (origOverlayDidPressNext) {
+        origOverlayDidPressNext(self, _cmd, sender);
+    }
 }
 
 // Installation function
@@ -2089,7 +2590,27 @@ __attribute__((constructor)) static void YTLP_InstallTweakHooks(void) {
                     origPlayerScrubToTime = (PlayerScrubToTimeIMP)method_getImplementation(scrubMethod);
                     method_setImplementation(scrubMethod, (IMP)ytlp_playerScrubToTime);
                 }
-                
+
+                // Hook seekToTime:seekSource: (used for double-tap seek)
+                Method seekSourceMethod = class_getInstanceMethod(PlayerVC, @selector(seekToTime:seekSource:));
+                if (seekSourceMethod && !origPlayerSeekToTimeSource) {
+                    origPlayerSeekToTimeSource = (PlayerSeekToTimeSourceIMP)method_getImplementation(seekSourceMethod);
+                    method_setImplementation(seekSourceMethod, (IMP)ytlp_playerSeekToTimeSource);
+                    #if DEBUG
+                    NSLog(@"[YTLocalQueue] Hooked seekToTime:seekSource:");
+                    #endif
+                }
+
+                // Hook seekToTime:toleranceBefore:toleranceAfter:seekSource: (most detailed variant)
+                Method seekToleranceMethod = class_getInstanceMethod(PlayerVC, @selector(seekToTime:toleranceBefore:toleranceAfter:seekSource:));
+                if (seekToleranceMethod && !origPlayerSeekToTimeToleranceSource) {
+                    origPlayerSeekToTimeToleranceSource = (PlayerSeekToTimeToleranceSourceIMP)method_getImplementation(seekToleranceMethod);
+                    method_setImplementation(seekToleranceMethod, (IMP)ytlp_playerSeekToTimeToleranceSource);
+                    #if DEBUG
+                    NSLog(@"[YTLocalQueue] Hooked seekToTime:toleranceBefore:toleranceAfter:seekSource:");
+                    #endif
+                }
+
                 if (!origPlayerViewDidAppear) allInstalled = NO;
             } else {
                 allInstalled = NO;
@@ -2156,89 +2677,165 @@ __attribute__((constructor)) static void YTLP_InstallTweakHooks(void) {
                 }
             }
 
-            // Hook YTCoWatchWatchEndpointWrapperCommandHandler (passthrough for now)
-            Class CommandHandler = objc_getClass("YTCoWatchWatchEndpointWrapperCommandHandler");
-            if (CommandHandler) {
-                Method m = class_getInstanceMethod(CommandHandler, @selector(sendOriginalCommandWithNavigationEndpoint:fromView:entry:sender:completionBlock:));
-                if (m && !origSendOriginalCommand) {
-                    origSendOriginalCommand = (SendOriginalCommandIMP)method_getImplementation(m);
-                    method_setImplementation(m, (IMP)ytlp_sendOriginalCommand);
+            // Removed deprecated hooks for WatchEndpoint and ResponderEvent as they were too aggressive
+
+
+            // Setup MPRemoteCommandCenter hook
+            // Since we can't easily swizzle the singleton's commands directly safely without potential side effects,
+            // we'll try to just add our target to the shared center's commands periodically or when app becomes active.
+            // But doing it once here is a good start.
+            ytlp_setupRemoteCommands();
+
+            // Hook YTFullscreenEngagementOverlayController (Related Videos Grid)
+            Class FullscreenEngagementClass = objc_getClass("YTFullscreenEngagementOverlayController");
+            if (FullscreenEngagementClass) {
+                Method m = class_getInstanceMethod(FullscreenEngagementClass, @selector(setRelatedVideosVisible:));
+                const char *typeEncoding = method_getTypeEncoding(m);
+                if (m) {
+                    class_addMethod(FullscreenEngagementClass, @selector(ytlp_setRelatedVideosVisible:), method_getImplementation(m), typeEncoding);
+                    method_setImplementation(m, imp_implementationWithBlock(^(id self, BOOL visible) {
+                        // If queue acts, FORCE HIDDEN
+                        if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
+                            visible = NO;
+                        }
+                        ((void (*)(id, SEL, BOOL))objc_msgSend)(self, @selector(ytlp_setRelatedVideosVisible:), visible);
+                    }));
                 }
             }
 
-            // Hook YTCommandResponderEvent to intercept command dispatch (for next button)
-            Class ResponderEvent = objc_getClass("YTCommandResponderEvent");
-            if (ResponderEvent) {
-                Method m = class_getInstanceMethod(ResponderEvent, @selector(send));
-                if (m && !origResponderEventSend) {
-                    origResponderEventSend = (ResponderEventSendIMP)method_getImplementation(m);
-                    method_setImplementation(m, (IMP)ytlp_responderEventSend);
-                }
+            // Hook YTCreatorEndscreenView (End Cards)
+            Class CreatorEndscreenClass = objc_getClass("YTCreatorEndscreenView");
+            if (CreatorEndscreenClass) {
+                 Method m = class_getInstanceMethod(CreatorEndscreenClass, @selector(setHidden:));
+                 const char *typeEncoding = method_getTypeEncoding(m);
+                 if (m) {
+                     class_addMethod(CreatorEndscreenClass, @selector(ytlp_setHidden:), method_getImplementation(m), typeEncoding);
+                     method_setImplementation(m, imp_implementationWithBlock(^(id self, BOOL hidden) {
+                         // If queue acts, FORCE HIDDEN (YES)
+                         if (YTLP_AutoAdvanceEnabled() && ![[YTLPLocalQueueManager shared] isEmpty]) {
+                             hidden = YES;
+                         }
+                         ((void (*)(id, SEL, BOOL))objc_msgSend)(self, @selector(ytlp_setHidden:), hidden);
+                     }));
+                 }
             }
 
-            // Hook the real YouTube Autoplay Controller (found from YouLoop tweak)
+            // ================================================================
+            // Hook YouTube Autoplay/Autonav Controller (Primary Interception)
+            // ================================================================
+            // NEW STRATEGY: Intercept navigation methods instead of forcing loop mode
             Class YTAutoplayAutonavControllerClass = objc_getClass("YTAutoplayAutonavController");
             if (YTAutoplayAutonavControllerClass) {
-                // Hook loopMode getter to completely disable autoplay when we have queue items
-                Method loopModeMethod = class_getInstanceMethod(YTAutoplayAutonavControllerClass, @selector(loopMode));
-                if (loopModeMethod && !origAutonavLoopMode) {
-                    origAutonavLoopMode = (AutonavLoopModeIMP)method_getImplementation(loopModeMethod);
-                    method_setImplementation(loopModeMethod, (IMP)ytlp_autonavLoopMode);
-                }
-                
-                // Hook init to disable autoplay from the start (like YouLoop approach)
+                #if DEBUG
+                NSLog(@"[YTLocalQueue] Installing YTAutoplayAutonavController hooks");
+                #endif
+
+                // Hook init to track controller instance
                 Method initMethod = class_getInstanceMethod(YTAutoplayAutonavControllerClass, @selector(initWithParentResponder:));
                 if (initMethod && !origAutonavInit) {
                     origAutonavInit = (AutonavInitIMP)method_getImplementation(initMethod);
                     method_setImplementation(initMethod, (IMP)ytlp_autonavInit);
                 }
-                
-                // Hook specific safe methods and try to find loop interception points
-                unsigned int methodCount;
-                Method *methods = class_copyMethodList(YTAutoplayAutonavControllerClass, &methodCount);
-                
-                for (unsigned int i = 0; i < methodCount; i++) {
-                    SEL selector = method_getName(methods[i]);
-                    NSString *selectorName = NSStringFromSelector(selector);
-                    
-                    // Hook setLoopMode
-                    if ([selectorName isEqualToString:@"setLoopMode:"] && !origAutonavSetLoopMode) {
-                        origAutonavSetLoopMode = (AutonavSetLoopModeIMP)method_getImplementation(methods[i]);
-                        method_setImplementation(methods[i], (IMP)ytlp_autonavSetLoopMode);
-                    }
-                    
-                    // Hook methods that might perform loop navigation
-                    else if (([selectorName containsString:@"performNavigation"] || 
-                              [selectorName containsString:@"navigate"] ||
-                              [selectorName containsString:@"perform"]) && 
-                             ![selectorName containsString:@"get"] &&
-                             ![selectorName containsString:@"set"] &&
-                             [selectorName hasSuffix:@""]) {
-                        
-                        if (!origAutonavPerformNavigation) {
-                            origAutonavPerformNavigation = (AutonavPerformNavigationIMP)method_getImplementation(methods[i]);
-                            method_setImplementation(methods[i], (IMP)ytlp_autonavPerformNavigation);
-                        }
-                    }
-                    
-                    // Hook methods that might execute navigation
-                    else if (([selectorName containsString:@"execute"] || 
-                              [selectorName containsString:@"advance"] ||
-                              [selectorName containsString:@"next"]) && 
-                             ![selectorName containsString:@"get"] &&
-                             ![selectorName containsString:@"set"] &&
-                             [selectorName hasSuffix:@""]) {
-                        
-                        if (!origAutonavExecuteNavigation) {
-                            origAutonavExecuteNavigation = (AutonavExecuteNavigationIMP)method_getImplementation(methods[i]);
-                            method_setImplementation(methods[i], (IMP)ytlp_autonavExecuteNavigation);
-                        }
-                    }
+
+                // Hook loopMode getter (but don't force it - just observe)
+                Method loopModeMethod = class_getInstanceMethod(YTAutoplayAutonavControllerClass, @selector(loopMode));
+                if (loopModeMethod && !origAutonavLoopMode) {
+                    origAutonavLoopMode = (AutonavLoopModeIMP)method_getImplementation(loopModeMethod);
+                    method_setImplementation(loopModeMethod, (IMP)ytlp_autonavLoopMode);
                 }
-                
-                free(methods);
+
+                // Hook playNext - PRIMARY HOOK for next button
+                Method playNextMethod = class_getInstanceMethod(YTAutoplayAutonavControllerClass, @selector(playNext));
+                if (playNextMethod && !origAutonavPlayNext) {
+                    origAutonavPlayNext = (AutonavPlayNextIMP)method_getImplementation(playNextMethod);
+                    method_setImplementation(playNextMethod, (IMP)ytlp_autonavPlayNext);
+                    #if DEBUG
+                    NSLog(@"[YTLocalQueue] Hooked playNext");
+                    #endif
+                }
+
+                // Hook playAutonav - PRIMARY HOOK for auto-advance at video end
+                Method playAutonavMethod = class_getInstanceMethod(YTAutoplayAutonavControllerClass, @selector(playAutonav));
+                if (playAutonavMethod && !origAutonavPlayAutonav) {
+                    origAutonavPlayAutonav = (AutonavPlayAutonavIMP)method_getImplementation(playAutonavMethod);
+                    method_setImplementation(playAutonavMethod, (IMP)ytlp_autonavPlayAutonav);
+                    #if DEBUG
+                    NSLog(@"[YTLocalQueue] Hooked playAutonav");
+                    #endif
+                }
+
+                // Hook playAutoplay - SECONDARY HOOK for autoplay
+                Method playAutoplayMethod = class_getInstanceMethod(YTAutoplayAutonavControllerClass, @selector(playAutoplay));
+                if (playAutoplayMethod && !origAutonavPlayAutoplay) {
+                    origAutonavPlayAutoplay = (AutonavPlayAutoplayIMP)method_getImplementation(playAutoplayMethod);
+                    method_setImplementation(playAutoplayMethod, (IMP)ytlp_autonavPlayAutoplay);
+                    #if DEBUG
+                    NSLog(@"[YTLocalQueue] Hooked playAutoplay");
+                    #endif
+                }
+
+                // Hook autonavEndpoint - Returns the next video endpoint
+                Method autonavEndpointMethod = class_getInstanceMethod(YTAutoplayAutonavControllerClass, @selector(autonavEndpoint));
+                if (autonavEndpointMethod && !origAutonavEndpoint) {
+                    origAutonavEndpoint = (AutonavEndpointIMP)method_getImplementation(autonavEndpointMethod);
+                    method_setImplementation(autonavEndpointMethod, (IMP)ytlp_autonavEndpoint);
+                    #if DEBUG
+                    NSLog(@"[YTLocalQueue] Hooked autonavEndpoint");
+                    #endif
+                }
+
+                // Hook nextEndpointForAutonav - YouTube uses this to get the actual next video
+                Method nextEndpointForAutonavMethod = class_getInstanceMethod(YTAutoplayAutonavControllerClass, @selector(nextEndpointForAutonav));
+                if (nextEndpointForAutonavMethod && !origNextEndpointForAutonav) {
+                    origNextEndpointForAutonav = (NextEndpointForAutonavIMP)method_getImplementation(nextEndpointForAutonavMethod);
+                    method_setImplementation(nextEndpointForAutonavMethod, (IMP)ytlp_nextEndpointForAutonav);
+                    #if DEBUG
+                    NSLog(@"[YTLocalQueue] Hooked nextEndpointForAutonav");
+                    #endif
+                }
+
+                // Hook autoplayEndpoint
+                Method autoplayEndpointMethod = class_getInstanceMethod(YTAutoplayAutonavControllerClass, @selector(autoplayEndpoint));
+                if (autoplayEndpointMethod && !origAutoplayEndpoint) {
+                    origAutoplayEndpoint = (AutoplayEndpointIMP)method_getImplementation(autoplayEndpointMethod);
+                    method_setImplementation(autoplayEndpointMethod, (IMP)ytlp_autoplayEndpoint);
+                    #if DEBUG
+                    NSLog(@"[YTLocalQueue] Hooked autoplayEndpoint");
+                    #endif
+                }
+
+                // Hook nextEndpointForAutoplay
+                Method nextEndpointForAutoplayMethod = class_getInstanceMethod(YTAutoplayAutonavControllerClass, @selector(nextEndpointForAutoplay));
+                if (nextEndpointForAutoplayMethod && !origNextEndpointForAutoplay) {
+                    origNextEndpointForAutoplay = (NextEndpointForAutoplayIMP)method_getImplementation(nextEndpointForAutoplayMethod);
+                    method_setImplementation(nextEndpointForAutoplayMethod, (IMP)ytlp_nextEndpointForAutoplay);
+                    #if DEBUG
+                    NSLog(@"[YTLocalQueue] Hooked nextEndpointForAutoplay");
+                    #endif
+                }
             }
-            
+
+            // ================================================================
+            // Hook YouTube Endscreen Controller (Show Countdown with Queue Video!)
+            // ================================================================
+            // Let countdown show, but display QUEUE video via autonavEndpoint hook
+            Class YTAutonavEndscreenControllerClass = objc_getClass("YTAutonavEndscreenController");
+            if (YTAutonavEndscreenControllerClass) {
+                #if DEBUG
+                NSLog(@"[YTLocalQueue] Installing YTAutonavEndscreenController hooks");
+                #endif
+
+                // Hook videoDidFinish - Track video end for state management
+                Method videoDidFinishMethod = class_getInstanceMethod(YTAutonavEndscreenControllerClass, @selector(videoDidFinish));
+                if (videoDidFinishMethod && !origEndscreenVideoDidFinish) {
+                    origEndscreenVideoDidFinish = (EndscreenVideoDidFinishIMP)method_getImplementation(videoDidFinishMethod);
+                    method_setImplementation(videoDidFinishMethod, (IMP)ytlp_endscreenVideoDidFinish);
+                    #if DEBUG
+                    NSLog(@"[YTLocalQueue] Hooked videoDidFinish (state tracking)");
+                    #endif
+                }
+            }
+
             // Also try generic autoplay classes
             NSArray *autoplayClasses = @[
                 @"YTAutoplayController",
@@ -2302,6 +2899,17 @@ __attribute__((constructor)) static void YTLP_InstallTweakHooks(void) {
                     origOverlayViewDidLoad = (OverlayViewDidLoadIMP)method_getImplementation(m);
                     method_setImplementation(m, (IMP)ytlp_overlayViewDidLoad);
                 }
+
+                // Hook didPressNext: to intercept native next button
+                Method didPressNextMethod = class_getInstanceMethod(OverlayViewController, @selector(didPressNext:));
+                if (didPressNextMethod && !origOverlayDidPressNext) {
+                    origOverlayDidPressNext = (OverlayDidPressNextIMP)method_getImplementation(didPressNextMethod);
+                    method_setImplementation(didPressNextMethod, (IMP)ytlp_overlayDidPressNext);
+                    #if DEBUG
+                    NSLog(@"[YTLocalQueue] Hooked didPressNext: on overlay");
+                    #endif
+                }
+
                 // Add target methods
                 class_addMethod(OverlayViewController, @selector(ytlp_addToQueueTapped:), (IMP)ytlp_addToQueueTapped, "v@:@");
                 class_addMethod(OverlayViewController, @selector(ytlp_showQueueTapped:), (IMP)ytlp_showQueueTapped, "v@:@");

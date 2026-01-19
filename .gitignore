@@ -1,0 +1,14 @@
+.env.local
+
+# Build artifacts
+.theos/
+packages/
+.DS_Store
+.build_number
+
+# Headers (downloaded separately)
+Headers/
+
+# Documentation (except README)
+*.md
+!README.md

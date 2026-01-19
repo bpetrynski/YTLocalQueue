@@ -31,19 +31,32 @@ static NSString *const kYTLPLocalQueueStorageKey = @"ytlp_local_queue_items";
 - (BOOL)isEmpty { __block BOOL e = YES; dispatch_sync(_syncQueue, ^{ e = _items.count == 0; }); return e; }
 
 - (void)addVideoId:(NSString *)videoId title:(NSString *)title {
+    [self addVideoId:videoId title:title channelName:nil];
+}
+
+- (void)addVideoId:(NSString *)videoId title:(NSString *)title channelName:(NSString *)channelName {
     if (videoId.length == 0) return;
-    NSDictionary *entry = @{ @"videoId": videoId, @"title": title ?: @"" };
+    NSDictionary *entry = @{ @"videoId": videoId, @"title": title ?: @"", @"channelName": channelName ?: @"" };
     dispatch_async(_syncQueue, ^{ [_items addObject:entry]; [self persist]; });
 }
 
 - (void)updateTitleForVideoId:(NSString *)videoId title:(NSString *)title {
-    if (videoId.length == 0 || title.length == 0) return;
+    [self updateMetadataForVideoId:videoId title:title channelName:nil];
+}
+
+- (void)updateMetadataForVideoId:(NSString *)videoId title:(NSString *)title channelName:(NSString *)channelName {
+    if (videoId.length == 0) return;
     dispatch_async(_syncQueue, ^{
         for (NSUInteger i = 0; i < _items.count; i++) {
             NSDictionary *item = _items[i];
             if ([item[@"videoId"] isEqualToString:videoId]) {
                 NSMutableDictionary *updatedItem = [item mutableCopy];
-                updatedItem[@"title"] = title;
+                if (title.length > 0) {
+                    updatedItem[@"title"] = title;
+                }
+                if (channelName.length > 0) {
+                    updatedItem[@"channelName"] = channelName;
+                }
                 _items[i] = [updatedItem copy];
                 [self persist];
                 break;
@@ -88,6 +101,16 @@ static NSString *const kYTLPLocalQueueStorageKey = @"ytlp_local_queue_items";
     return next;
 }
 
+- (NSDictionary *)peekNextItem {
+    __block NSDictionary *next = nil;
+    dispatch_sync(_syncQueue, ^{
+        if (_items.count > 0) {
+            next = [_items.firstObject copy];
+        }
+    });
+    return next;
+}
+
 - (NSString *)titleForVideoId:(NSString *)videoId {
     if (videoId.length == 0) return nil;
     __block NSString *title = nil;
@@ -103,8 +126,12 @@ static NSString *const kYTLPLocalQueueStorageKey = @"ytlp_local_queue_items";
 }
 
 - (void)insertVideoId:(NSString *)videoId title:(NSString *)title atIndex:(NSUInteger)index {
+    [self insertVideoId:videoId title:title channelName:nil atIndex:index];
+}
+
+- (void)insertVideoId:(NSString *)videoId title:(NSString *)title channelName:(NSString *)channelName atIndex:(NSUInteger)index {
     if (videoId.length == 0) return;
-    NSDictionary *entry = @{ @"videoId": videoId, @"title": title ?: @"" };
+    NSDictionary *entry = @{ @"videoId": videoId, @"title": title ?: @"", @"channelName": channelName ?: @"" };
     dispatch_async(_syncQueue, ^{
         NSUInteger insertIndex = (index < _items.count) ? index : _items.count;
         [_items insertObject:entry atIndex:insertIndex];
@@ -120,9 +147,13 @@ static NSString *const kYTLPLocalQueueStorageKey = @"ytlp_local_queue_items";
 #pragma mark - Currently Playing
 
 - (void)setCurrentlyPlayingVideoId:(NSString *)videoId title:(NSString *)title {
+    [self setCurrentlyPlayingVideoId:videoId title:title channelName:nil];
+}
+
+- (void)setCurrentlyPlayingVideoId:(NSString *)videoId title:(NSString *)title channelName:(NSString *)channelName {
     dispatch_async(_syncQueue, ^{
         if (videoId.length > 0) {
-            _currentlyPlayingItem = @{ @"videoId": videoId, @"title": title ?: @"" };
+            _currentlyPlayingItem = @{ @"videoId": videoId, @"title": title ?: @"", @"channelName": channelName ?: @"" };
         } else {
             _currentlyPlayingItem = nil;
         }

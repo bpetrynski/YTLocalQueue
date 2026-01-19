@@ -8,7 +8,7 @@
 #import "LocalQueueViewController.h"
 
 static const NSInteger YTLocalQueueSection = 931; // unique tweak section id
-static NSString *const kYTLPVersion = @"0.0.1";
+static NSString *const kYTLPVersion = @"0.0.1+build22";
 
 static BOOL YTLP_AutoAdvanceEnabled(void) {
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"ytlp_queue_auto_advance_enabled"];
